@@ -4,4 +4,4 @@
 //   1. Edit BACKEND_URL below to your deployed FastAPI backend URL, OR
 //   2. Leave as-is for local dev (backend on localhost:8000).
 // Make sure CORS_ALLOWED_ORIGINS on the backend includes your Vercel domain.
-window.BACKEND_URL = "https://gitmind-backend.onrender.com";
+window.BACKEND_URL = "https://gitmind-backend-pgv8.onrender.com";
