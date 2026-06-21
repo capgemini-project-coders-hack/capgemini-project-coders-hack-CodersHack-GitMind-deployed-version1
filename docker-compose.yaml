@@ -1,0 +1,78 @@
+# docker-compose.yaml — local/dev orchestration for GitMind
+#
+# Usage:
+#   cp .env.example .env        # then fill in your real values
+#   docker compose up --build
+#
+# Secrets live ONLY in your local .env file (gitignored + dockerignored).
+# They are injected into containers at runtime via `env_file:` below —
+# they are never copied into either image. See README-Docker.md.
+
+services:
+  # Neo4j Database — OPTIONAL local container.
+  # Not needed/used when NEO4J_URI in .env points at a cloud instance
+  # (e.g. Neo4j Aura, neo4j+s://...). Only starts if you explicitly run:
+  #   docker compose --profile local-neo4j up
+  neo4j:
+    image: neo4j:5.20.0
+    container_name: gitmind-neo4j
+    profiles: ["local-neo4j"]
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-password}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_server_memory_pagecache_size=512M
+      - NEO4J_server_memory_heap_initial_size=512M
+      - NEO4J_server_memory_heap_max_size=1G
+    volumes:
+      - neo4j_data:/data
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "${NEO4J_USER:-neo4j}", "-p", "${NEO4J_PASSWORD:-password}", "RETURN 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - gitmind-network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: gitmind-backend:latest
+    container_name: gitmind-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - gitmind-network
+    restart: unless-stopped
+
+  # Static Frontend (plain HTML/CSS/JS — see frontend/)
+  # In production this is deployed to Vercel instead; this service is just
+  # for local dev parity. Edit frontend/config.js to point BACKEND_URL at
+  # http://localhost:8000 (already the default) before using this.
+  frontend:
+    image: nginx:alpine
+    container_name: gitmind-frontend
+    ports:
+      - "8501:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    depends_on:
+      - backend
+    networks:
+      - gitmind-network
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:
+
+networks:
+  gitmind-network:
+    driver: bridge

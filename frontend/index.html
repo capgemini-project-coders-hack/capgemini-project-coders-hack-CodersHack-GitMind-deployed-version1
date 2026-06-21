@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitMind</title>
+<link rel="icon" type="image/jpeg" href="assets/GitMind_favicon.jpeg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- NAVBAR -->
+<div class="gm-nav">
+  <div class="gm-nav-brand"><img src="assets/GitMind_logo.jpeg" class="gm-logo-img" alt="GitMind">GitMind</div>
+  <ul class="gm-nav-links">
+    <li><a href="#how-it-works">How It Works</a></li>
+    <li><a href="#features">Features</a></li>
+    <li><a href="#integrations">Integrations</a></li>
+    <li><a href="#get-access">Get Access</a></li>
+  </ul>
+  <div class="gm-nav-cta">
+    <a href="demo.html" class="gm-btn">Request Demo</a>
+  </div>
+</div>
+
+<!-- HERO -->
+<div class="gm-hero">
+  <div class="gm-hero-grid">
+    <div class="gm-hero-left">
+      <div class="gm-tag">Causal Debugging Co-Pilot</div>
+      <h1 class="gm-h1">Stop chasing bugs. Trace them to the decision that caused them.</h1>
+      <p class="gm-hero-sub">GitMind connects your GitHub, Jira, Slack, and meeting transcripts into a causal knowledge graph &mdash; so you know not just <em>where</em> code broke, but <em>why</em>.</p>
+      <div class="gm-hero-btn-row">
+        <button class="gm-btn gm-hero-btn" id="heroAccessBtn">Request Early Access</button>
+        <button class="gm-btn-outline gm-hero-btn" id="heroHiwBtn">See How It Works</button>
+      </div>
+    </div>
+    <div class="gm-hero-right">
+      <div class="gm-diagram">
+        <div class="gm-diagram-title">Data Sources</div>
+        <div class="gm-node"><div class="gm-node-dot">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#0070F3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+        </div>GitHub &mdash; Commits &amp; pull requests</div>
+        <div class="gm-node"><div class="gm-node-dot">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#0070F3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 9h6M9 12h6M9 15h4"/></svg>
+        </div>Jira &mdash; Tickets &amp; business context</div>
+        <div class="gm-node"><div class="gm-node-dot">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#0070F3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 10c-.83 0-1.5-.67-1.5-1.5v-5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5v5c0 .83-.67 1.5-1.5 1.5z"/><path d="M20.5 10H19V8.5c0-.83.67-1.5 1.5-1.5s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/><path d="M9.5 14c.83 0 1.5.67 1.5 1.5v5c0 .83-.67 1.5-1.5 1.5S8 21.33 8 20.5v-5c0-.83.67-1.5 1.5-1.5z"/><path d="M3.5 14H5v1.5c0 .83-.67 1.5-1.5 1.5S2 16.33 2 15.5 2.67 14 3.5 14z"/><path d="M14 14.5c0-.83.67-1.5 1.5-1.5h5c.83 0 1.5.67 1.5 1.5s-.67 1.5-1.5 1.5h-5c-.83 0-1.5-.67-1.5-1.5z"/><path d="M15.5 19H14v1.5c0 .83.67 1.5 1.5 1.5s1.5-.67 1.5-1.5-.67-1.5-1.5-1.5z"/><path d="M10 9.5C10 8.67 9.33 8 8.5 8h-5C2.67 8 2 8.67 2 9.5S2.67 11 3.5 11h5c.83 0 1.5-.67 1.5-1.5z"/><path d="M8.5 5H10V3.5C10 2.67 9.33 2 8.5 2S7 2.67 7 3.5 7.67 5 8.5 5z"/></svg>
+        </div>Slack &mdash; Informal decisions &amp; threads</div>
+        <div class="gm-node"><div class="gm-node-dot">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#0070F3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+        </div>Meetings &mdash; Verbal decisions &amp; notes</div>
+        <div class="gm-node"><div class="gm-node-dot">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#0070F3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        </div>ADR Files &mdash; Architecture decisions</div>
+        <div class="gm-diagram-arrow">&#8595;</div>
+        <div class="gm-diagram-output">
+          <div class="gm-output-icon-box">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          </div>
+          <div><div class="gm-output-sub">Output</div>Root Cause + Annotated Patch</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TRUST BAR -->
+<div class="gm-trust">
+  <span class="gm-trust-label">Works with</span>
+  <span class="gm-trust-item">GitHub</span>
+  <span class="gm-trust-item">Jira</span>
+  <span class="gm-trust-item">Slack</span>
+  <span class="gm-trust-item">Notion</span>
+  <span class="gm-trust-item">Google Meet</span>
+  <span class="gm-trust-item">Confluence</span>
+</div>
+
+<!-- HOW IT WORKS -->
+<div id="how-it-works" class="gm-section gm-section-grey">
+  <span class="gm-section-label">Process</span>
+  <h2 class="gm-h2">From bug report to root cause in seconds</h2>
+  <p class="gm-section-sub">Four stages, fully automated. No manual log-digging, no context switching between tools.</p>
+  <div class="gm-steps-grid">
+    <div class="gm-step-col">
+      <div class="gm-step-line"></div>
+      <div class="gm-step-num">STEP 01</div>
+      <div class="gm-step-title">Ingest</div>
+      <p class="gm-step-desc">Connect your org's tools. GitMind pulls commits, tickets, threads, and meeting notes into a unified pipeline.</p>
+    </div>
+    <div class="gm-step-col">
+      <div class="gm-step-line"></div>
+      <div class="gm-step-num">STEP 02</div>
+      <div class="gm-step-title">Build</div>
+      <p class="gm-step-desc">A causal knowledge graph is constructed, linking every line of code to the commit, ticket, and decision behind it.</p>
+    </div>
+    <div class="gm-step-col">
+      <div class="gm-step-line"></div>
+      <div class="gm-step-num">STEP 03</div>
+      <div class="gm-step-title">Analyze</div>
+      <p class="gm-step-desc">Claude AI traverses the graph backwards from the bug, surfacing the chain of decisions that led to the failure.</p>
+    </div>
+    <div class="gm-step-col">
+      <div class="gm-step-line"></div>
+      <div class="gm-step-num">STEP 04</div>
+      <div class="gm-step-title">Fix</div>
+      <p class="gm-step-desc">Receive an annotated patch with context: what changed, why, and what future developers need to know.</p>
+    </div>
+  </div>
+</div>
+
+<!-- FEATURES -->
+<div id="features" class="gm-section">
+  <span class="gm-section-label">Capabilities</span>
+  <h2 class="gm-h2">Debug with full organizational context</h2>
+  <p class="gm-section-sub">GitMind does not just read code. It reads your organization's decision history.</p>
+  <div class="gm-features-grid">
+    <div class="gm-card">
+      <div class="gm-card-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0070F3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
+      </div>
+      <div class="gm-card-title">Causal Blame Traversal</div>
+      <p class="gm-card-desc">Walks backward through commits, tickets, and Slack threads to identify the exact human decision that introduced the bug, not just the line that broke.</p>
+    </div>
+    <div class="gm-card">
+      <div class="gm-card-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0070F3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+      </div>
+      <div class="gm-card-title">Zero Regression Check</div>
+      <p class="gm-card-desc">Before any patch is approved, GitMind validates all downstream graph nodes. No fix ships that creates a new failure elsewhere.</p>
+    </div>
+    <div class="gm-card">
+      <div class="gm-card-icon">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#0070F3" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+      </div>
+      <div class="gm-card-title">Annotated Patch Output</div>
+      <p class="gm-card-desc">Every suggested fix includes three annotations: why the change was made, which original decision it respects, and what future developers must know.</p>
+    </div>
+  </div>
+</div>
+
+<!-- INTEGRATIONS -->
+<div id="integrations" class="gm-integrations">
+  <span class="gm-integrations-label">Integrations</span>
+  <h2 class="gm-integrations-h2">Plug into your existing stack</h2>
+  <p class="gm-integrations-sub">No migration. No new tools. GitMind connects to the systems your team already uses.</p>
+  <div class="gm-integrations-grid">
+    <div class="gm-int-item"><div class="gm-int-abbr">GH</div>GitHub</div>
+    <div class="gm-int-item"><div class="gm-int-abbr">JR</div>Jira</div>
+    <div class="gm-int-item"><div class="gm-int-abbr">SL</div>Slack</div>
+    <div class="gm-int-item"><div class="gm-int-abbr">NT</div>Notion</div>
+    <div class="gm-int-item"><div class="gm-int-abbr">GM</div>Google Meet</div>
+    <div class="gm-int-item"><div class="gm-int-abbr">ZM</div>Zoom</div>
+    <div class="gm-int-item"><div class="gm-int-abbr">CF</div>Confluence</div>
+    <div class="gm-int-item"><div class="gm-int-abbr">AD</div>ADR Files</div>
+  </div>
+  <p class="gm-integrations-more">More integrations in progress. <span class="gm-integrations-request">Request one</span></p>
+</div>
+
+<!-- WAITLIST -->
+<div id="get-access" class="gm-section">
+  <div class="gm-waitlist-wrap">
+    <span class="gm-section-label gm-center">Early Access</span>
+    <h2 class="gm-h2 gm-center gm-h2-waitlist">Be first to debug at the speed of intent</h2>
+
+    <form id="waitlistForm" class="gm-waitlist-form" autocomplete="off">
+      <input type="text" id="emailInput" class="gm-text-input" placeholder="your@company.com" aria-label="Work email address">
+      <button type="submit" class="gm-btn gm-btn-full" id="joinBtn">Join Waitlist</button>
+    </form>
+    <div id="formMsg" class="gm-form-msg" role="status"></div>
+    <p id="waitlistCount" class="gm-waitlist-count"></p>
+    <p class="gm-no-spam">No spam. Launch notification only.</p>
+  </div>
+</div>
+
+<!-- FOOTER -->
+<div class="gm-footer">
+  <div class="gm-footer-grid">
+    <div>
+      <div class="gm-footer-brand"><img src="assets/GitMind_logo.jpeg" class="gm-logo-img-sm" alt="GitMind">GitMind</div>
+      <div class="gm-footer-tagline">Causal Debugging Co-Pilot</div>
+      <div class="gm-footer-socials">
+        <div class="gm-footer-social">GH</div>
+        <div class="gm-footer-social">IN</div>
+        <div class="gm-footer-social">X</div>
+      </div>
+    </div>
+    <div>
+      <div class="gm-footer-col-label">Product</div>
+      <span class="gm-footer-link">Features</span>
+      <span class="gm-footer-link">Integrations</span>
+      <span class="gm-footer-link">Security</span>
+      <span class="gm-footer-link">Pricing</span>
+    </div>
+    <div>
+      <div class="gm-footer-col-label">Company</div>
+      <span class="gm-footer-link">About</span>
+      <span class="gm-footer-link">Blog</span>
+      <span class="gm-footer-link">Docs</span>
+      <span class="gm-footer-link">Contact</span>
+    </div>
+  </div>
+  <div class="gm-footer-bottom">
+    <span>&#169; 2026 GitMind. Built for engineers who care about why.</span>
+    <span>Privacy &middot; Terms</span>
+  </div>
+</div>
+
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

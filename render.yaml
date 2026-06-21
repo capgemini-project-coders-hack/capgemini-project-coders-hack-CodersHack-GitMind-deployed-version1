@@ -1,0 +1,111 @@
+# render.yaml — Render Blueprint for GitMind (backend only)
+# =============================================================================
+# Deploys gitmind-backend (FastAPI) as a Docker-based web service on Render,
+# built straight from this repo's Dockerfile.backend.
+#
+# The frontend is a static HTML/CSS/JS site (see frontend/) — it does NOT
+# deploy via this Blueprint. Deploy it separately to Vercel (or any static
+# host): `cd frontend && vercel deploy`.
+#
+# HOW TO USE THIS:
+#   1. Push this repo to GitHub/GitLab/Bitbucket.
+#   2. In the Render Dashboard: New > Blueprint > connect this repo.
+#   3. Render reads this file and shows you every env var marked
+#      `sync: false` below — fill in your real values there (never in this
+#      file, never committed to git). See README-Render.md for the full
+#      step-by-step walkthrough and what each secret is for.
+#   4. Click "Deploy Blueprint". Render builds Dockerfile.backend.
+#   5. Deploy frontend/ to Vercel separately, then come back and fill in
+#      CORS_ALLOWED_ORIGINS below with the Vercel URL.
+#
+# WHAT'S AUTOMATIC vs. WHAT YOU FILL IN:
+#   - CORS_ALLOWED_ORIGINS is sync:false and must be filled in manually
+#     with your Vercel deployment's URL (e.g. https://your-project.vercel.app),
+#     once you know it — you'll have it after the first Vercel deploy.
+#   - Every credential (Neo4j, Google, Snowflake, GitHub, Jira, Slack) is
+#     sync:false — Render prompts for each one during Blueprint creation.
+#     These never appear in this file or in git.
+
+services:
+  # ---------------------------------------------------------------------
+  # Backend — FastAPI (backend/main.py), built from Dockerfile.backend
+  # ---------------------------------------------------------------------
+  - type: web
+    name: gitmind-backend
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile.backend
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      # --- Neo4j (required) ---
+      - key: NEO4J_URI
+        sync: false
+      - key: NEO4J_USER
+        sync: false
+      - key: NEO4J_PASSWORD
+        sync: false
+      - key: NEO4J_DATABASE
+        value: neo4j
+
+      # --- Google AI Studio / Gemini (required) ---
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GITMIND_MODEL
+        value: gemini-1.5-pro
+      - key: GITMIND_MAX_TOKENS
+        value: "4096"
+      - key: GITMIND_TEMPERATURE
+        value: "0.0"
+      - key: GITMIND_MAX_ITERATIONS
+        value: "10"
+
+      # --- Snowflake (required) ---
+      - key: SNOWFLAKE_ACCOUNT
+        sync: false
+      - key: SNOWFLAKE_USER
+        sync: false
+      - key: SNOWFLAKE_PASSWORD
+        sync: false
+      - key: SNOWFLAKE_WAREHOUSE
+        sync: false
+      - key: SNOWFLAKE_DATABASE
+        sync: false
+      - key: SNOWFLAKE_SCHEMA
+        value: PUBLIC
+      - key: SNOWFLAKE_ROLE
+        value: PUBLIC
+
+      # --- GitHub (required) ---
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_ORG
+        sync: false
+      - key: GITHUB_DEFAULT_REPOS
+        sync: false
+
+      # --- Jira (required) ---
+      - key: JIRA_URL
+        sync: false
+      - key: JIRA_USER
+        sync: false
+      - key: JIRA_API_TOKEN
+        sync: false
+      - key: JIRA_DEFAULT_PROJECT
+        value: PLAT
+
+      # --- Slack (required) ---
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: SLACK_DEFAULT_CHANNELS
+        value: "#incidents,#engineering"
+
+      # --- CORS ---
+      # Fill in manually with your Vercel frontend URL once deployed.
+      # Example value:
+      #   https://gitmind.vercel.app
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false

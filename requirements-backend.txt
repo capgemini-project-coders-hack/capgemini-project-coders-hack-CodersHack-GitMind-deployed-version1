@@ -1,0 +1,26 @@
+# requirements-backend.txt
+# Dependencies for the FastAPI backend service (backend/main.py)
+# Used by: Dockerfile.backend
+
+# Web framework
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.0.0
+
+# LLM / agent (backend/agent/gitmind_agent.py, regression_guard.py)
+langchain>=0.2.0
+langchain-google-genai>=1.0.0
+google-generativeai>=0.5.0
+
+# Data sources (backend/graph, backend/snowflake_client.py, backend/utils)
+neo4j>=5.0.0
+snowflake-connector-python[pandas]>=3.0.0
+cryptography>=40.0.0
+PyGithub>=1.59.0
+jira>=3.0.0
+slack-sdk>=3.20.0
+networkx>=3.0
+requests>=2.31.0
+
+# Config
+python-dotenv>=1.0.0

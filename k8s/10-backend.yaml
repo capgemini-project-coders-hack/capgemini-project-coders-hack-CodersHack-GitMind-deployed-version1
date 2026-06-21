@@ -1,0 +1,71 @@
+# k8s/10-backend.yaml
+# FastAPI backend Deployment + internal Service.
+#
+# Image reference assumes you've pushed to a registry, e.g.:
+#   docker build -f Dockerfile.backend -t <registry>/gitmind-backend:latest .
+#   docker push <registry>/gitmind-backend:latest
+# Replace <registry>/gitmind-backend:latest below with your real image
+# (e.g. an ECR URI: 123456789012.dkr.ecr.us-east-1.amazonaws.com/gitmind-backend:latest)
+#
+# Apply:
+#   kubectl apply -f k8s/00-namespace.yaml
+#   kubectl create secret generic gitmind-secrets -n gitmind --from-env-file=.env
+#   (or apply k8s/01-secret-external.yaml for AWS Secrets Manager sync)
+#   kubectl apply -f k8s/10-backend.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitmind-backend
+  namespace: gitmind
+  labels:
+    app: gitmind-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gitmind-backend
+  template:
+    metadata:
+      labels:
+        app: gitmind-backend
+    spec:
+      containers:
+        - name: backend
+          image: <registry>/gitmind-backend:latest
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: gitmind-secrets
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gitmind-backend
+  namespace: gitmind
+spec:
+  selector:
+    app: gitmind-backend
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: ClusterIP

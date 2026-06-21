@@ -1,0 +1,8 @@
+# k8s/00-namespace.yaml
+# Isolates all GitMind resources in their own namespace.
+#
+# Apply: kubectl apply -f k8s/00-namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitmind

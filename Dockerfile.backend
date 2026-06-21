@@ -1,0 +1,57 @@
+# Dockerfile.backend — FastAPI backend service (backend/main.py)
+#
+# Build (from repo root):
+#   docker build -f Dockerfile.backend -t gitmind-backend:latest .
+#
+# Run (secrets supplied at RUNTIME via --env-file, never baked into the image):
+#   docker run --env-file .env -p 8000:8000 gitmind-backend:latest
+#
+# This image contains ZERO secrets. backend/config.py reads everything
+# from environment variables at process start, not from anything written
+# into this image. See README-Docker.md for the full explanation.
+#
+# Render deploys this same image and injects its own PORT env var, which
+# the CMD below honors automatically (falls back to 8000 if PORT is unset,
+# so local docker run / docker-compose behavior is unchanged). See
+# README-Render.md for the full Render Blueprint setup.
+
+FROM python:3.11-slim AS base
+
+# Prevent Python from writing .pyc files and buffering stdout/stderr —
+# makes container logs show up immediately instead of being buffered.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+# System deps needed to build some packages (cryptography, snowflake connector)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies first (separate layer = better build caching;
+# code changes won't force a full dependency reinstall)
+COPY requirements-backend.txt .
+RUN pip install --no-cache-dir -r requirements-backend.txt
+
+# Now copy only the backend application code (no .env, no frontend, no k8s —
+# see .dockerignore)
+COPY backend/ ./backend/
+
+# Run as a non-root user inside the container
+RUN useradd --create-home --uid 1000 gitmind && chown -R gitmind:gitmind /app
+USER gitmind
+
+EXPOSE 8000
+
+# Render (and some other PaaS targets) inject a PORT env var and require the
+# process to bind to it. Locally / in docker-compose / ECS / EKS, PORT is
+# unset, so this falls back to the original fixed port 8000 — nothing about
+# the existing local workflow changes.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD sh -c "python -c \"import urllib.request,os; urllib.request.urlopen('http://localhost:' + os.environ.get('PORT','8000') + '/health', timeout=3)\"" || exit 1
+
+CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

@@ -1,0 +1,22 @@
+# requirements.txt — full development environment (backend + tests + lint)
+#
+# The frontend is a static HTML/CSS/JS site (see frontend/) with no Python
+# dependencies — it's deployed separately to Vercel.
+#
+# Docker images do NOT use this file directly — Dockerfile.backend uses
+# requirements-backend.txt so the image only installs what it runs.
+#
+# Use this file for local development (`pip install -r requirements.txt`)
+# when you want everything available at once, e.g. to run the backend
+# test suite.
+
+-r requirements-backend.txt
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+
+# Dev tooling
+black>=23.0.0
+isort>=5.12.0
+ruff>=0.1.0
