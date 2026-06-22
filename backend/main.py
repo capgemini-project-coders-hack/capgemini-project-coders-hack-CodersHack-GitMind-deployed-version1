@@ -513,19 +513,18 @@ def fetch_github_repo(payload: GitHubFetchRequest) -> dict[str, Any]:
         except Exception:
             commits = []
 
-        detailed = []
-        for c in commits:
-            sha = c.get("sha")
-            try:
-                detail = github_api.get_commit_detail(owner, repo, sha, token=token)
-                for f in detail.get("files", []):
-                    if f.get("patch") and len(f["patch"]) > 20000:
-                        f["patch"] = f["patch"][:20000] + "\n...truncated..."
-                detailed.append(detail)
-            except Exception:
-                detailed.append({"sha": sha, "error": "failed to fetch details"})
-
-        result["commits"][b_name] = detailed
+        # Return lightweight commit list only — no per-commit detail calls.
+        # Detail (files/patches) fetched on demand via GET /github/commits/{sha}.
+        result["commits"][b_name] = [
+            {
+                "sha": c.get("sha", ""),
+                "message": (c.get("commit") or {}).get("message", ""),
+                "author": ((c.get("commit") or {}).get("author") or {}).get("name", ""),
+                "date": ((c.get("commit") or {}).get("author") or {}).get("date", ""),
+                "url": c.get("html_url", ""),
+            }
+            for c in commits
+        ]
 
     return result
 
@@ -575,6 +574,21 @@ def github_file_content(payload: GitHubFileRequest) -> dict[str, Any]:
     except Exception:
         text = raw.decode("utf-8", errors="replace")
     return {"owner": owner, "repo": repo, "path": payload.path, "ref": ref, "content": text}
+
+
+@router.get("/github/commit/{owner}/{repo}/{sha}")
+def github_commit_detail(owner: str, repo: str, sha: str) -> dict[str, Any]:
+    """Fetch full diff/files for a single commit on demand."""
+    from backend.utils import github_api
+    token = _os.getenv("GITHUB_TOKEN") or None
+    try:
+        detail = github_api.get_commit_detail(owner, repo, sha, token=token)
+        for f in detail.get("files", []):
+            if f.get("patch") and len(f["patch"]) > 20000:
+                f["patch"] = f["patch"][:20000] + "\n...truncated..."
+        return detail
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch commit detail: {exc}")
 
 
 @router.get("/github/commits")
