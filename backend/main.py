@@ -486,11 +486,17 @@ def fetch_github_repo(payload: GitHubFetchRequest) -> dict[str, Any]:
         repo_info = github_api.get_repo_info(owner, repo, token=token)
         default_branch = repo_info.get("default_branch")
     except Exception as exc:
+        exc_str = str(exc)
+        if "403" in exc_str or "rate limit" in exc_str.lower():
+            raise HTTPException(status_code=429, detail="GitHub API rate limit reached. Set GITHUB_TOKEN on the backend to increase the limit to 5000 req/hr.")
         raise HTTPException(status_code=502, detail=f"Failed to fetch repo info: {exc}")
 
     try:
         branches = github_api.list_branches(owner, repo, token=token)
     except Exception as exc:
+        exc_str = str(exc)
+        if "403" in exc_str or "rate limit" in exc_str.lower():
+            raise HTTPException(status_code=429, detail="GitHub API rate limit reached. Set GITHUB_TOKEN on the backend.")
         raise HTTPException(status_code=502, detail=f"Failed to list branches: {exc}")
 
     branch_names = [b["name"] if isinstance(b, dict) else b for b in branches]
@@ -510,7 +516,10 @@ def fetch_github_repo(payload: GitHubFetchRequest) -> dict[str, Any]:
                 commits = github_api.list_all_commits(owner, repo, b_name, token=token)
             else:
                 commits = github_api.list_commits(owner, repo, b_name, per_page=payload.per_branch_limit, token=token)
-        except Exception:
+        except Exception as exc:
+            exc_str = str(exc)
+            if "403" in exc_str or "rate limit" in exc_str.lower():
+                raise HTTPException(status_code=429, detail="GitHub API rate limit reached. Set GITHUB_TOKEN on the backend.")
             commits = []
 
         # Return lightweight commit list only — no per-commit detail calls.
