@@ -501,10 +501,14 @@ def fetch_github_repo(payload: GitHubFetchRequest) -> dict[str, Any]:
         "commits": {},
     }
 
-    # For each branch, fetch a limited set of commits and their diffs
+    # For each branch, fetch ALL commits (paginated) and their diffs
     for b in branches:
         try:
-            commits = github_api.list_commits(owner, repo, b, per_page=payload.per_branch_limit, token=token)
+            if payload.include_file_previews:
+                # Full mode: fetch all commits with diffs (slow but complete)
+                commits = github_api.list_all_commits(owner, repo, b, token=token)
+            else:
+                commits = github_api.list_commits(owner, repo, b, per_page=payload.per_branch_limit, token=token)
         except Exception:
             commits = []
 
@@ -584,6 +588,57 @@ def github_commits(owner: str, repo: str, branch: str, per_page: int = 30, page:
     return {"owner": owner, "repo": repo, "branch": branch, "page": page, "per_page": per_page, "commits": commits}
 
 
+@router.post("/github/all_commits")
+def github_all_commits(payload: GitHubFetchRequest) -> dict[str, Any]:
+    """Fetch ALL commits across ALL branches of a repo.
+
+    Returns a flat list per branch. Useful for whole-repo causal analysis.
+    Use `per_branch_limit` to cap max commits per branch (0 = unlimited, default 100/page * 10 pages).
+    """
+    from backend.utils import github_api
+
+    try:
+        owner, repo, path, ref = github_api.parse_github_url(payload.url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid GitHub URL: {exc}")
+
+    token = _os.getenv("GITHUB_TOKEN") or None
+
+    try:
+        branches_raw = github_api.list_branches(owner, repo, token=token)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to list branches: {exc}")
+
+    branch_names = [b["name"] if isinstance(b, dict) else b for b in branches_raw]
+
+    all_commits: dict[str, Any] = {}
+    for branch in branch_names:
+        try:
+            commits = github_api.list_all_commits(owner, repo, branch, token=token)
+            all_commits[branch] = [
+                {
+                    "sha": c.get("sha", ""),
+                    "message": (c.get("commit") or {}).get("message", ""),
+                    "author": ((c.get("commit") or {}).get("author") or {}).get("name", ""),
+                    "date": ((c.get("commit") or {}).get("author") or {}).get("date", ""),
+                    "url": c.get("html_url", ""),
+                }
+                for c in commits
+            ]
+        except Exception as exc:
+            log.warning("Failed fetching all commits for branch %s: %s", branch, exc)
+            all_commits[branch] = []
+
+    total = sum(len(v) for v in all_commits.values())
+    return {
+        "owner": owner,
+        "repo": repo,
+        "branches": branch_names,
+        "total_commits": total,
+        "commits_by_branch": all_commits,
+    }
+
+
 @router.post("/slack/events")
 async def slack_events(
     request: Request,
@@ -651,19 +706,22 @@ def create_app() -> FastAPI:
     # your Vercel domain, set via CORS_ALLOWED_ORIGINS. The default below
     # only covers local dev: docker-compose's nginx-served static frontend
     # (port 8501) and a bare `python -m http.server` / similar (port 8080).
-    _CORS_ORIGINS = [
-        o.strip()
-        for o in _os.getenv(
-            "CORS_ALLOWED_ORIGINS",
-            "http://localhost:8501,http://frontend:8501,http://localhost:8080",
-        ).split(",")
-        if o.strip()
-    ]
+    _raw_origins = _os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "http://localhost:8501,http://frontend:8501,http://localhost:8080",
+    )
+    _CORS_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+    # If caller explicitly sets CORS_ALLOWED_ORIGINS=* allow all origins
+    # (useful for demo / hackathon deployments where the Vercel URL isn't
+    # known yet).  In that case allow_credentials must be False per the
+    # CORS spec — browsers reject credentials + wildcard.
+    _allow_all = _CORS_ORIGINS == ["*"]
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=_CORS_ORIGINS,
-        allow_credentials=True,
+        allow_origins=["*"] if _allow_all else _CORS_ORIGINS,
+        allow_credentials=not _allow_all,
         allow_methods=["GET", "POST"],
         allow_headers=["Content-Type", "Authorization"],
     )
