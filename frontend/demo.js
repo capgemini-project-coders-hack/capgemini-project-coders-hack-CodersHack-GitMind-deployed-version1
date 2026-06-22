@@ -73,6 +73,7 @@ def analyze_repository(repo_url):
     dm_error: null,
     dm_repo: "",
     dm_github: null,
+    dm_all_commits: null,
     dm_selected_branch: null,
     dm_commit_pages: {}, // branch -> page number
   };
@@ -170,9 +171,9 @@ def analyze_repository(repo_url):
       state.dm_loading = false;
     }
 
-    // POST /github/fetch (best-effort, same as original)
+    // POST /github/fetch for repo metadata + /github/all_commits for full history
     try {
-      const ghResp = await postJSON("/github/fetch", { url: state.dm_repo, per_branch_limit: 6 }, 60000);
+      const ghResp = await postJSON("/github/fetch", { url: state.dm_repo, per_branch_limit: 30 }, 60000);
       if (ghResp.status === 200) {
         state.dm_github = await ghResp.json();
         state.dm_selected_branch = state.dm_github.default_branch ||
@@ -183,6 +184,16 @@ def analyze_repository(repo_url):
       }
     } catch (err) {
       state.dm_github = null;
+    }
+
+    // Fetch ALL commits across ALL branches for whole-repo analysis
+    try {
+      const allResp = await postJSON("/github/all_commits", { url: state.dm_repo }, 120000);
+      if (allResp.status === 200) {
+        state.dm_all_commits = await allResp.json();
+      }
+    } catch (err) {
+      state.dm_all_commits = null;
     }
 
     renderAll();
@@ -392,7 +403,9 @@ def analyze_repository(repo_url):
     repoExplorer.style.display = "block";
 
     const defaultBranchLine = document.getElementById("defaultBranchLine");
-    defaultBranchLine.textContent = `Default branch: ${gh.default_branch || ""}`;
+    const totalCommits = state.dm_all_commits ? state.dm_all_commits.total_commits : "…";
+    const branchCount = state.dm_all_commits ? state.dm_all_commits.branches.length : (gh.branches || []).length;
+    defaultBranchLine.textContent = `Default branch: ${gh.default_branch || ""} · ${branchCount} branch(es) · ${totalCommits} total commits (all branches)`;
 
     const branchSelect = document.getElementById("branchSelect");
     const branches = gh.branches || [];
@@ -434,16 +447,19 @@ def analyze_repository(repo_url):
     let commits = [];
     try {
       const resp = await getJSON("/github/commits", {
-        owner: gh.owner, repo: gh.repo, branch: sel, per_page: 6, page: page,
+        owner: gh.owner, repo: gh.repo, branch: sel, per_page: 30, page: page,
       }, 20000);
       if (resp.status === 200) {
         const data = await resp.json();
         commits = data.commits || [];
       } else {
-        commits = (gh.commits && gh.commits[sel]) || [];
+        // fallback: use all_commits data sliced for this branch/page
+        const allBranchCommits = (state.dm_all_commits && state.dm_all_commits.commits_by_branch && state.dm_all_commits.commits_by_branch[sel]) || (gh.commits && gh.commits[sel]) || [];
+        commits = allBranchCommits.slice((page - 1) * 30, page * 30);
       }
     } catch (err) {
-      commits = (gh.commits && gh.commits[sel]) || [];
+      const allBranchCommits = (state.dm_all_commits && state.dm_all_commits.commits_by_branch && state.dm_all_commits.commits_by_branch[sel]) || (gh.commits && gh.commits[sel]) || [];
+      commits = allBranchCommits.slice((page - 1) * 30, page * 30);
     }
 
     if (!commits.length) {
@@ -476,7 +492,8 @@ def analyze_repository(repo_url):
 
     let fileList = [];
     try {
-      const resp = await postJSON("/github/list_files", { url: state.dm_repo, per_branch_limit: 6 }, 30000);
+      // Pass selected branch so list_files uses git trees API recursively
+      const resp = await postJSON("/github/list_files", { url: state.dm_repo, per_branch_limit: 100 }, 30000);
       if (resp.status === 200) {
         const data = await resp.json();
         fileList = data.files || [];
