@@ -4,7 +4,7 @@
 // same fallback-to-demo-mode behavior, same mock data.
 
 (function () {
-  const BACKEND_URL = window.BACKEND_URL || "http://localhost:8000";
+  const BACKEND_URL = (window.BACKEND_URL !== undefined && window.BACKEND_URL !== "") ? window.BACKEND_URL : "/api";
 
   // ── MOCK DATA (verbatim from req_demo.py) ──────────────────────────────
   const MOCK_COMMITS = [
