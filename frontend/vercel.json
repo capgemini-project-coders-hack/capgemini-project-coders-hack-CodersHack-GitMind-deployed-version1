@@ -1,6 +1,12 @@
 {
   "cleanUrls": false,
   "trailingSlash": false,
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://gitmind-backend-pgv8.onrender.com/:path*"
+    }
+  ],
   "headers": [
     {
       "source": "/(.*)",
