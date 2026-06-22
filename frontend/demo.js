@@ -470,20 +470,41 @@ def analyze_repository(repo_url):
     let html = "";
     commits.forEach((c) => {
       const sha = c.sha || "";
-      const msg = c.message || "";
-      html += `<div style="margin-bottom:14px;"><strong style="font-family:'JetBrains Mono',monospace;font-size:12px;">${escapeHtml(sha.slice(0,8))}</strong> — ${escapeHtml(msg)}`;
-      const files = c.files || [];
-      files.slice(0, 5).forEach((f) => {
-        html += `
-          <div style="margin-top:4px;font-size:12px;color:#64748B;">
-            ${escapeHtml(f.filename || "")} — +${f.additions || 0} -${f.deletions || 0}
-            ${f.patch ? `<details style="margin-top:4px;"><summary style="cursor:pointer;color:#0070F3;font-size:12px;">Patch: ${escapeHtml(f.filename || "")}</summary><pre style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:6px;padding:8px;font-size:11px;overflow-x:auto;white-space:pre-wrap;">${escapeHtml(f.patch.slice(0, 20000))}</pre></details>` : ""}
-          </div>`;
-      });
-      html += `</div>`;
+      const msg = c.message || (((c.commit || {}).message) || "");
+      const author = c.author || (((c.commit || {}).author || {}).name) || "";
+      const date = c.date || (((c.commit || {}).author || {}).date || "");
+      const shortDate = date ? new Date(date).toLocaleDateString() : "";
+      html += `<div style="margin-bottom:14px;">
+        <strong style="font-family:'JetBrains Mono',monospace;font-size:12px;">${escapeHtml(sha.slice(0,8))}</strong>
+        — ${escapeHtml(msg.split("\n")[0])}
+        <span style="color:#94A3B8;font-size:11px;margin-left:8px;">${escapeHtml(author)} ${shortDate}</span>
+        <details style="margin-top:4px;" onToggle="if(this.open && !this.dataset.loaded){this.dataset.loaded=1; loadCommitDetail(this, '${escapeHtml(gh.owner)}','${escapeHtml(gh.repo)}','${escapeHtml(sha)}');}">
+          <summary style="cursor:pointer;color:#0070F3;font-size:12px;">View changed files</summary>
+          <div class="commit-detail-${escapeHtml(sha)}" style="margin-top:6px;font-size:12px;color:#64748B;">Loading…</div>
+        </details>
+      </div>`;
     });
     commitsList.innerHTML = html;
   }
+
+  async function loadCommitDetail(detailEl, owner, repo, sha) {
+    const container = detailEl.querySelector(`[class^="commit-detail-"]`);
+    try {
+      const resp = await fetch(`${BACKEND_URL}/github/commit/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${encodeURIComponent(sha)}`, { signal: AbortSignal.timeout(20000) });
+      if (!resp.ok) throw new Error(resp.status);
+      const data = await resp.json();
+      const files = data.files || [];
+      if (!files.length) { container.textContent = "No file changes."; return; }
+      container.innerHTML = files.slice(0, 10).map(f => `
+        <div style="margin-bottom:8px;">
+          <span style="color:#334155;">${escapeHtml(f.filename || "")}</span>
+          <span style="color:#22c55e;margin-left:6px;">+${f.additions||0}</span>
+          <span style="color:#ef4444;margin-left:4px;">-${f.deletions||0}</span>
+          ${f.patch ? `<details style="margin-top:4px;"><summary style="cursor:pointer;color:#0070F3;font-size:11px;">Patch</summary><pre style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:6px;padding:8px;font-size:11px;overflow-x:auto;white-space:pre-wrap;">${escapeHtml(f.patch.slice(0,20000))}</pre></details>` : ""}
+        </div>`).join("");
+    } catch(e) {
+      container.textContent = `Failed to load: ${e}`;
+    }
 
   async function loadFileExplorer() {
     const fileSelect = document.getElementById("fileSelect");
