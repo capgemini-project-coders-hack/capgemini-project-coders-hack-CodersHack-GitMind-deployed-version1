@@ -180,10 +180,12 @@ def analyze_repository(repo_url):
         state.dm_selected_branch = state.dm_github.default_branch ||
           (state.dm_github.branches && state.dm_github.branches[0]) || "";
         state.dm_commit_pages = {};
+        renderAll(); // re-render now that real GitHub data is available
       } else if (ghResp.status === 429) {
         const errData = await ghResp.json().catch(() => ({}));
         state.dm_github = null;
         state.dm_rate_limit_error = errData.detail || "GitHub API rate limit reached. The backend needs a GITHUB_TOKEN environment variable set on Render.";
+        renderAll();
       } else {
         state.dm_github = null;
       }
@@ -196,6 +198,7 @@ def analyze_repository(repo_url):
       const allResp = await postJSON("/github/all_commits", { url: state.dm_repo }, 120000);
       if (allResp.status === 200) {
         state.dm_all_commits = await allResp.json();
+        renderAll(); // re-render with full commit counts
       }
     } catch (err) {
       state.dm_all_commits = null;
@@ -231,12 +234,24 @@ def analyze_repository(repo_url):
           <div class="dm-status-label-connected">&#9679; Connected</div>
           <div class="dm-status-repo">${escapeHtml(short)}</div>
         </div>`;
+      // Real stats from fetched GitHub data
+      const totalCommits = state.dm_all_commits
+        ? state.dm_all_commits.total_commits
+        : (state.dm_github
+            ? Object.values(state.dm_github.commits || {}).reduce((s, arr) => s + arr.length, 0)
+            : 47);
+      const totalBranches = state.dm_github
+        ? (state.dm_github.branches || []).length
+        : 0;
+      const causalChain = (state.dm_result && state.dm_result.causal_chain) || [];
+      const issues = causalChain.length || (state.dm_github ? 0 : 2);
+      const regressions = (state.dm_result && state.dm_result.regression_check && state.dm_result.regression_check.regressions_found) ? state.dm_result.regression_check.regressions_found.length : 0;
       statsBox.innerHTML = `
         <div class="dm-stats-grid">
-          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#003D6B;">47</div><div class="dm-stat-label">Commits</div></div>
-          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#003D6B;">12</div><div class="dm-stat-label">Tickets</div></div>
-          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#0070F3;">2</div><div class="dm-stat-label">Issues</div></div>
-          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#10B981;">0</div><div class="dm-stat-label">Regressions</div></div>
+          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#003D6B;">${totalCommits}</div><div class="dm-stat-label">Commits</div></div>
+          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#003D6B;">${totalBranches}</div><div class="dm-stat-label">Branches</div></div>
+          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#0070F3;">${issues}</div><div class="dm-stat-label">Issues</div></div>
+          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#10B981;">${regressions}</div><div class="dm-stat-label">Regressions</div></div>
         </div>`;
     } else {
       statusBox.innerHTML = `
@@ -250,10 +265,14 @@ def analyze_repository(repo_url):
 
   function renderGraph() {
     const chain = (state.dm_result && state.dm_result.causal_chain) || [];
+
+    // Use real commit data to build intent graph when no causal chain
+    const gh = state.dm_github;
+    const ghCommits = gh
+      ? Object.values(gh.commits || {}).flat().slice(0, 20)
+      : [];
+
     if (chain.length > 0) {
-      // No pyvis in-browser equivalent bundled; render a simple node list
-      // summarizing the causal chain (keeps wiring/data identical; visual
-      // network rendering can be swapped for a JS graph lib if desired).
       const NODE_COLORS = {
         Commit: "#0070F3", Function: "#10B981", JiraTicket: "#F59E0B",
         Ticket: "#F59E0B", SlackMessage: "#8B5CF6", ADR: "#EF4444", Decision: "#EC4899",
@@ -275,6 +294,31 @@ def analyze_repository(repo_url):
       });
       html += `</div>`;
       graphPanelBody.innerHTML = html;
+
+    } else if (ghCommits.length > 0) {
+      // Build intent graph from real commits
+      let html = `<div style="padding:16px;background:#F8FAFC;border-radius:0 0 8px 8px;min-height:280px;">
+        <div style="font-size:11px;color:#94A3B8;margin-bottom:10px;text-transform:uppercase;letter-spacing:.05em;">Commit Intent Graph — ${gh.owner}/${gh.repo}</div>`;
+      ghCommits.forEach((c, i) => {
+        const sha = (c.sha || "").slice(0, 8);
+        const msg = (c.message || "").split("\n")[0].slice(0, 70);
+        const author = c.author || "";
+        // Color by conventional commit prefix
+        const type = msg.match(/^(feat|fix|chore|refactor|docs|test|style|perf)/i);
+        const colorMap = { feat:"#10B981", fix:"#EF4444", chore:"#94A3B8", refactor:"#F59E0B", docs:"#3B82F6", test:"#8B5CF6", style:"#EC4899", perf:"#F97316" };
+        const color = type ? (colorMap[type[1].toLowerCase()] || "#0070F3") : "#0070F3";
+        html += `
+          <div style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;${i > 0 ? "border-top:1px dashed #E2E8F0;" : ""}">
+            <div style="width:10px;height:10px;border-radius:50%;background:${color};flex-shrink:0;margin-top:3px;"></div>
+            <div>
+              <div style="font-size:12px;font-weight:600;color:#0F172A;font-family:'JetBrains Mono',monospace;">${escapeHtml(sha)}<span style="font-family:inherit;color:#94A3B8;font-weight:400;margin-left:8px;font-size:11px;">${escapeHtml(author)}</span></div>
+              <div style="font-size:11px;color:#334155;margin-top:2px;">${escapeHtml(msg)}</div>
+            </div>
+          </div>`;
+      });
+      html += `</div>`;
+      graphPanelBody.innerHTML = html;
+
     } else {
       graphPanelBody.innerHTML = EMPTY_GRAPH_HTML;
     }
@@ -362,7 +406,54 @@ def analyze_repository(repo_url):
     let body;
     if (state.dm_loaded) {
       const result = state.dm_result;
-      if (state.dm_error === "demo" || result == null) {
+      const chain = result ? (result.causal_chain || []) : [];
+
+      if (chain.length > 0) {
+        // Live causal chain from backend
+        let items = "";
+        chain.forEach((node) => {
+          items += `
+            <div class="dm-tl-item">
+              <div class="dm-tl-dot"></div>
+              <div class="dm-tl-sha">${escapeHtml((node.source_id || "").slice(0, 8))}</div>
+              <div class="dm-tl-msg">${escapeHtml((node.summary || "").slice(0, 80))}</div>
+              <div class="dm-tl-meta">${escapeHtml(node.source_type || "")} &middot; ${escapeHtml(node.label || "")}</div>
+            </div>`;
+        });
+        body = `<div class="dm-timeline">${items}</div>`;
+
+      } else if (state.dm_github) {
+        // Real commits from GitHub fetch — use selected branch or default
+        const gh = state.dm_github;
+        const branch = state.dm_selected_branch || gh.default_branch || "";
+        const branchCommits = (gh.commits && gh.commits[branch]) || [];
+        // Also try all_commits
+        const allBranchCommits = (state.dm_all_commits && state.dm_all_commits.commits_by_branch && state.dm_all_commits.commits_by_branch[branch]) || branchCommits;
+        const commits = allBranchCommits.slice(0, 20);
+
+        if (commits.length) {
+          let items = "";
+          commits.forEach((c) => {
+            const sha = (c.sha || "").slice(0, 8);
+            const msg = (c.message || (((c.commit||{}).message)||"")).split("\n")[0].slice(0, 80);
+            const author = c.author || (((c.commit||{}).author||{}).name) || "";
+            const date = c.date || (((c.commit||{}).author||{}).date) || "";
+            const shortDate = date ? new Date(date).toLocaleDateString() : "";
+            items += `
+              <div class="dm-tl-item">
+                <div class="dm-tl-dot"></div>
+                <div class="dm-tl-sha">${escapeHtml(sha)}</div>
+                <div class="dm-tl-msg">${escapeHtml(msg)}</div>
+                <div class="dm-tl-meta">${escapeHtml(author)}${shortDate ? " &middot; " + shortDate : ""}</div>
+              </div>`;
+          });
+          body = `<div class="dm-timeline">${items}</div>`;
+        } else {
+          body = `<div class="dm-empty"><div class="dm-empty-icon">&#9201;</div><div class="dm-empty-title">No timeline data</div><div class="dm-empty-desc">No commits found for branch: ${escapeHtml(branch)}.</div></div>`;
+        }
+
+      } else if (state.dm_error === "demo") {
+        // Fallback mock — only when no real data at all
         let items = "";
         MOCK_COMMITS.forEach(([sha, msg, author, t]) => {
           items += `
@@ -374,23 +465,9 @@ def analyze_repository(repo_url):
             </div>`;
         });
         body = `<div class="dm-timeline">${items}</div>`;
-      } else if (result) {
-        const chain = result.causal_chain || [];
-        let items = "";
-        chain.forEach((node) => {
-          items += `
-            <div class="dm-tl-item">
-              <div class="dm-tl-dot"></div>
-              <div class="dm-tl-sha">${escapeHtml((node.source_id || "").slice(0, 8))}</div>
-              <div class="dm-tl-msg">${escapeHtml((node.summary || "").slice(0, 80))}</div>
-              <div class="dm-tl-meta">${escapeHtml(node.source_type || "")} &middot; ${escapeHtml(node.label || "")}</div>
-            </div>`;
-        });
-        body = items
-          ? `<div class="dm-timeline">${items}</div>`
-          : `<div class="dm-empty"><div class="dm-empty-icon">&#9201;</div><div class="dm-empty-title">No timeline data</div><div class="dm-empty-desc">No causal nodes returned from backend.</div></div>`;
+
       } else {
-        body = `<div class="dm-empty"><div class="dm-empty-icon">&#9201;</div><div class="dm-empty-title">Timeline empty</div><div class="dm-empty-desc">Commit history and causal links will appear here after analysis.</div></div>`;
+        body = `<div class="dm-empty"><div class="dm-empty-icon">&#9201;</div><div class="dm-empty-title">No timeline data</div><div class="dm-empty-desc">No causal nodes returned from backend.</div></div>`;
       }
     } else {
       body = `<div class="dm-empty"><div class="dm-empty-icon">&#9201;</div><div class="dm-empty-title">Timeline empty</div><div class="dm-empty-desc">Commit history and causal links will appear here after analysis.</div></div>`;
