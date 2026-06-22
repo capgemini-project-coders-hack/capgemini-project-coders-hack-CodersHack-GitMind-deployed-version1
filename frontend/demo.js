@@ -74,6 +74,7 @@ def analyze_repository(repo_url):
     dm_repo: "",
     dm_github: null,
     dm_all_commits: null,
+    dm_rate_limit_error: null,
     dm_selected_branch: null,
     dm_commit_pages: {}, // branch -> page number
   };
@@ -179,6 +180,10 @@ def analyze_repository(repo_url):
         state.dm_selected_branch = state.dm_github.default_branch ||
           (state.dm_github.branches && state.dm_github.branches[0]) || "";
         state.dm_commit_pages = {};
+      } else if (ghResp.status === 429) {
+        const errData = await ghResp.json().catch(() => ({}));
+        state.dm_github = null;
+        state.dm_rate_limit_error = errData.detail || "GitHub API rate limit reached. The backend needs a GITHUB_TOKEN environment variable set on Render.";
       } else {
         state.dm_github = null;
       }
@@ -397,7 +402,14 @@ def analyze_repository(repo_url):
   function renderRepoExplorer() {
     const gh = state.dm_github;
     if (!state.dm_loaded || !gh) {
-      repoExplorer.style.display = "none";
+      if (state.dm_rate_limit_error) {
+        repoExplorer.style.display = "block";
+        repoExplorer.innerHTML = `<div style="background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:14px;color:#DC2626;font-size:13px;">
+          ⚠️ <strong>GitHub API Rate Limit</strong><br>${state.dm_rate_limit_error}
+        </div>`;
+      } else {
+        repoExplorer.style.display = "none";
+      }
       return;
     }
     repoExplorer.style.display = "block";
