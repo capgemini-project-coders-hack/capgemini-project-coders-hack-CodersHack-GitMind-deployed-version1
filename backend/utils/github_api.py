@@ -102,16 +102,68 @@ def get_commit_detail(owner: str, repo: str, sha: str, token: str | None = None)
     return resp.json()
 
 
-def list_repo_files(owner: str, repo: str, ref: str | None = None, token: str | None = None) -> list[dict[str, Any]]:
-    params = {"ref": ref} if ref else {}
-    resp = requests.get(
-        f"{GITHUB_API}/repos/{owner}/{repo}/contents/",
-        params=params,
+def list_all_commits(
+    owner: str,
+    repo: str,
+    branch: str,
+    token: str | None = None,
+    max_pages: int = 10,
+) -> list[dict[str, Any]]:
+    """Fetch ALL commits on a branch (up to max_pages * 100)."""
+    all_commits: list[dict[str, Any]] = []
+    for page in range(1, max_pages + 1):
+        resp = requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/commits",
+            params={"sha": branch, "per_page": 100, "page": page},
+            headers=_headers(token),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        all_commits.extend(batch)
+        if len(batch) < 100:
+            break
+    return all_commits
+
+
+def list_repo_files(owner: str, repo: str, ref: str | None = None, token: str | None = None) -> list[str]:
+    """Return ALL file paths in the repo recursively using the git trees API."""
+    # First resolve the SHA for the given ref (or default branch)
+    if ref:
+        branch_resp = requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/branches/{ref}",
+            headers=_headers(token),
+            timeout=15,
+        )
+        if branch_resp.ok:
+            sha = branch_resp.json()["commit"]["sha"]
+        else:
+            # ref might be a commit SHA already
+            sha = ref
+    else:
+        repo_info = get_repo_info(owner, repo, token=token)
+        default_branch = repo_info.get("default_branch", "main")
+        branch_resp = requests.get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/branches/{default_branch}",
+            headers=_headers(token),
+            timeout=15,
+        )
+        branch_resp.raise_for_status()
+        sha = branch_resp.json()["commit"]["sha"]
+
+    # Use git trees API with recursive=1 to get ALL files in one call
+    tree_resp = requests.get(
+        f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{sha}",
+        params={"recursive": "1"},
         headers=_headers(token),
-        timeout=15,
+        timeout=30,
     )
-    resp.raise_for_status()
-    return resp.json()
+    tree_resp.raise_for_status()
+    data = tree_resp.json()
+    # Return only blob (file) paths, not trees (dirs)
+    return [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
 
 
 def get_file_content(
