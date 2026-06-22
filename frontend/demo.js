@@ -147,11 +147,11 @@ def analyze_repository(repo_url):
 
     renderLoading();
 
-    const queryText = `why did the repository ${state.dm_repo} fail`;
+    const queryText = `analyze repository ${state.dm_repo}`;
 
     // POST /query
     try {
-      const resp = await postJSON("/query", { query: queryText }, 30000);
+      const resp = await postJSON("/query", { query: queryText }, 70000);
       if (resp.status === 200) {
         state.dm_result = await resp.json();
         state.dm_loaded = true;
@@ -181,6 +181,27 @@ def analyze_repository(repo_url):
           (state.dm_github.branches && state.dm_github.branches[0]) || "";
         state.dm_commit_pages = {};
         renderAll(); // re-render now that real GitHub data is available
+
+        // If initial /query returned no causal chain, retry with a real commit SHA
+        // so the backend can anchor a proper Neo4j traversal instead of rejecting.
+        if (!state.dm_result || !(state.dm_result.causal_chain || []).length) {
+          const branch = state.dm_selected_branch;
+          const commits = (state.dm_github.commits && state.dm_github.commits[branch]) || [];
+          const sha = commits.length > 0 ? commits[0].sha : null;
+          if (sha) {
+            try {
+              const causalResp = await postJSON("/query", { query: `trace commit ${sha}` }, 70000);
+              if (causalResp.status === 200) {
+                const causalData = await causalResp.json();
+                if ((causalData.causal_chain || []).length > 0) {
+                  state.dm_result = causalData;
+                  state.dm_error = null;
+                }
+              }
+            } catch (_) { /* non-fatal */ }
+            renderAll();
+          }
+        }
       } else if (ghResp.status === 429) {
         const errData = await ghResp.json().catch(() => ({}));
         state.dm_github = null;
@@ -266,11 +287,22 @@ def analyze_repository(repo_url):
   function renderGraph() {
     const chain = (state.dm_result && state.dm_result.causal_chain) || [];
 
-    // Use real commit data to build intent graph when no causal chain
+    // Use real commit data to build intent graph when no causal chain.
+    // Merge both sources: dm_github.commits and dm_all_commits.commits_by_branch
     const gh = state.dm_github;
-    const ghCommits = gh
-      ? Object.values(gh.commits || {}).flat().slice(0, 20)
-      : [];
+    const ghCommits = (() => {
+      const fromGh = gh ? Object.values(gh.commits || {}).flat() : [];
+      const fromAll = state.dm_all_commits && state.dm_all_commits.commits_by_branch
+        ? Object.values(state.dm_all_commits.commits_by_branch).flat()
+        : [];
+      // Merge, deduplicate by sha, take first 20
+      const seen = new Set();
+      return [...fromGh, ...fromAll].filter(c => {
+        if (!c.sha || seen.has(c.sha)) return false;
+        seen.add(c.sha);
+        return true;
+      }).slice(0, 20);
+    })();
 
     if (chain.length > 0) {
       const NODE_COLORS = {
