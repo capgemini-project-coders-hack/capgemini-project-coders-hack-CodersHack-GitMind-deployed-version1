@@ -342,6 +342,93 @@ def analyze_repository(repo_url):
     }
   }
 
+  // ── Neo4j-style node-link graph renderer ────────────────────────────────
+  const RELATION_LABELS = {
+    "Commit->Function": "INTRODUCED_IN",
+    "Commit->Decision": "TRIGGERED",
+    "Commit->ADR": "PROMPTED",
+    "Function->Decision": "INFLUENCED_BY",
+    "Function->Ticket": "FLAGGED_IN",
+    "Function->JiraTicket": "FLAGGED_IN",
+    "Decision->Ticket": "REPORTED_IN",
+    "Decision->JiraTicket": "REPORTED_IN",
+    "Decision->ADR": "DOCUMENTED_IN",
+    "ADR->Ticket": "TRACKED_IN",
+    "Ticket->SlackMessage": "DISCUSSED_IN",
+  };
+
+  function relationLabel(fromLabel, toLabel) {
+    return RELATION_LABELS[`${fromLabel}->${toLabel}`] || "LED_TO";
+  }
+
+  function buildCausalGraphSVG(chain, nodeColors) {
+    const r = 28;
+    const n = chain.length;
+    const spacing = 165;
+    const width = Math.max(560, (n - 1) * spacing + 2 * 90);
+    const height = 230;
+    const cy = height / 2;
+
+    const nodes = chain.map((node, i) => ({
+      x: 90 + i * spacing,
+      y: cy + Math.sin(i * 1.35) * 46,
+      label: node.label || "Node",
+      nodeId: (node.node_id || String(i)).slice(0, 10),
+      color: nodeColors[node.label] || "#64748B",
+    }));
+
+    let defs = `
+      <defs>
+        <marker id="gm-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#94A3B8"></path>
+        </marker>
+      </defs>`;
+
+    let edgesSvg = "";
+    for (let i = 0; i < n - 1; i++) {
+      const a = nodes[i], b = nodes[i + 1];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const ux = dx / dist, uy = dy / dist;
+      const x1 = a.x + ux * r, y1 = a.y + uy * r;
+      const x2 = b.x - ux * (r + 5), y2 = b.y - uy * (r + 5);
+      const midX = (x1 + x2) / 2, midY = (y1 + y2) / 2;
+      let angle = Math.atan2(dy, dx) * 180 / Math.PI;
+      if (angle > 90 || angle < -90) angle += 180;
+      const rel = escapeHtml(relationLabel(a.label, b.label));
+      const labelW = rel.length * 5.6 + 12;
+      edgesSvg += `
+        <line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"
+              stroke="#CBD5E1" stroke-width="1.5" marker-end="url(#gm-arrow)"></line>
+        <g transform="translate(${midX.toFixed(1)},${midY.toFixed(1)}) rotate(${angle.toFixed(1)})">
+          <rect x="${(-labelW / 2).toFixed(1)}" y="-8" width="${labelW.toFixed(1)}" height="16" rx="4" fill="#F8FAFC" stroke="#E2E8F0"></rect>
+          <text x="0" y="3.5" text-anchor="middle" font-size="9" font-weight="600" letter-spacing="0.3" fill="#64748B" font-family="JetBrains Mono, monospace">${rel}</text>
+        </g>`;
+    }
+
+    let nodesSvg = "";
+    nodes.forEach((node) => {
+      const initial = escapeHtml(node.label.charAt(0).toUpperCase());
+      nodesSvg += `
+        <g>
+          <circle cx="${node.x.toFixed(1)}" cy="${node.y.toFixed(1)}" r="${r}" fill="${node.color}" stroke="#fff" stroke-width="3"></circle>
+          <text x="${node.x.toFixed(1)}" y="${(node.y + 4).toFixed(1)}" text-anchor="middle" font-size="15" font-weight="700" fill="#fff" font-family="Inter, sans-serif">${initial}</text>
+          <text x="${node.x.toFixed(1)}" y="${(node.y + r + 16).toFixed(1)}" text-anchor="middle" font-size="11" font-weight="600" fill="#0F172A" font-family="Inter, sans-serif">${escapeHtml(node.label)}</text>
+          <text x="${node.x.toFixed(1)}" y="${(node.y + r + 29).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="#94A3B8" font-family="JetBrains Mono, monospace">${escapeHtml(node.nodeId)}</text>
+        </g>`;
+    });
+
+    return `
+      <div style="margin-top:14px;background:#fff;border:1px solid #E2E8F0;border-radius:8px;overflow-x:auto;">
+        <div style="font-size:11px;color:#94A3B8;padding:10px 14px 0;text-transform:uppercase;letter-spacing:.05em;">Graph View</div>
+        <svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="display:block;min-width:${width}px;">
+          ${defs}
+          ${edgesSvg}
+          ${nodesSvg}
+        </svg>
+      </div>`;
+  }
+
   function renderGraph() {
     const chain = (state.dm_result && state.dm_result.causal_chain) || [];
 
@@ -383,6 +470,7 @@ def analyze_repository(repo_url):
           </div>`;
       });
       html += `</div>`;
+      html += buildCausalGraphSVG(chain, NODE_COLORS);
       graphPanelBody.innerHTML = html;
 
     } else if (ghCommits.length > 0) {
