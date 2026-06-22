@@ -10,7 +10,7 @@ from fastapi import FastAPI, APIRouter, HTTPException, Request, BackgroundTasks,
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from backend.config import GitMindConfig, GitMindConfigError
+from backend.config import GitMindConfig, GitMindConfigError, Neo4jConfig, SnowflakeConfig, LLMConfig
 from backend.snowflake_client import SnowflakeClient
 from backend.graph.causal_graph import GraphPathNode, Neo4jCausalGraph
 from backend.agent.gitmind_agent import (
@@ -342,9 +342,13 @@ router = APIRouter()
 
 @router.get("/health")
 def health(request: Request) -> dict[str, Any]:
+    neo4j_ready = bool(getattr(request.app.state, "neo4j_graph", None))
+    snowflake_ready = bool(getattr(request.app.state, "snowflake_details", None))
     return {
         "status": "ok",
-        "runtime_ready": bool(getattr(request.app.state, "neo4j_graph", None) and getattr(request.app.state, "snowflake_details", None)),
+        "runtime_ready": neo4j_ready and snowflake_ready,
+        "neo4j_ready": neo4j_ready,
+        "snowflake_ready": snowflake_ready,
     }
 
 
@@ -386,6 +390,17 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
             raise HTTPException(
                 status_code=422,
                 detail="Clarify the specific Function name, Ticket ID, or graph node ID before running causal traversal.",
+            )
+
+        if graph is None:
+            # Partial-connector state: snowflake connected but neo4j didn't
+            # (or never finished initialising). Without this guard the code
+            # below would call .trace() on None and surface a confusing
+            # "'NoneType' object has no attribute 'trace'" message instead
+            # of a clear, actionable one.
+            raise HTTPException(
+                status_code=503,
+                detail="Neo4j is not connected on this backend (NEO4J_URI/NEO4J_USER/NEO4J_PASSWORD missing, or the connection failed at startup). Causal traversal is unavailable until this is fixed.",
             )
 
         # Primary path: run the full LLM agent
@@ -440,6 +455,16 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
                         f"direct Neo4j/Snowflake fallback also failed: {fallback_exc}"
                     ),
                 ) from fallback_exc
+
+    if snowflake is None:
+        # Partial-connector state: neo4j connected but snowflake didn't.
+        # Without this guard, the calls below would hit .fetch_by_id()/
+        # .count()/.fetch_summary() on None and raise a confusing
+        # NoneType AttributeError instead of a clear, actionable 503.
+        raise HTTPException(
+            status_code=503,
+            detail="Snowflake is not connected on this backend (SNOWFLAKE_* environment variables missing, or the connection failed at startup). Evidence lookups are unavailable until this is fixed.",
+        )
 
     table = infer_table(enriched.query, enriched.table)
     try:
@@ -753,12 +778,36 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     def startup() -> None:
+        # NOTE: this used to load everything through GitMindConfig.from_env(),
+        # which ALSO requires SLACK_BOT_TOKEN, JIRA_URL/JIRA_USER/JIRA_API_TOKEN,
+        # and GITHUB_TOKEN to be set -- none of which /query or the causal
+        # graph actually need. Because that loader collects every missing
+        # var and raises ONE combined error, a single absent Slack/Jira/
+        # GitHub variable was enough to skip the Neo4j connection attempt
+        # entirely and force full demo mode, even with perfectly valid
+        # Neo4j + Snowflake credentials. Load each piece independently so
+        # they can succeed or fail on their own.
         try:
-            cfg = GitMindConfig.from_env()
-            cfg.snowflake.validate()
+            neo4j_cfg: Neo4jConfig | None = Neo4jConfig.from_env()
         except GitMindConfigError as exc:
-            log.warning("GitMind API started without live connectors: %s", exc)
-            # No live credentials — set demo runtime so agent can still run in placeholder mode
+            log.warning("Neo4j not configured: %s", exc)
+            neo4j_cfg = None
+
+        try:
+            snowflake_cfg: SnowflakeConfig | None = SnowflakeConfig.from_env()
+            snowflake_cfg.validate()
+        except GitMindConfigError as exc:
+            log.warning("Snowflake not configured: %s", exc)
+            snowflake_cfg = None
+
+        try:
+            llm_cfg: LLMConfig | None = LLMConfig.from_env()
+        except GitMindConfigError as exc:
+            log.warning("LLM (GOOGLE_API_KEY) not configured: %s", exc)
+            llm_cfg = None
+
+        if neo4j_cfg is None and snowflake_cfg is None:
+            log.warning("GitMind API started without live connectors: neither Neo4j nor Snowflake configured.")
             try:
                 set_runtime(GitMindRuntime.demo())
             except Exception:
@@ -767,44 +816,57 @@ def create_app() -> FastAPI:
 
         from neo4j import GraphDatabase
 
-        try:
-            neo4j_driver = GraphDatabase.driver(
-                cfg.neo4j.uri,
-                auth=(cfg.neo4j.user, cfg.neo4j.password),
-                connection_timeout=10,
-                connection_acquisition_timeout=10,
-            )
-            neo4j_driver.verify_connectivity()
+        neo4j_driver = None
+        if neo4j_cfg is not None:
+            try:
+                neo4j_driver = GraphDatabase.driver(
+                    neo4j_cfg.uri,
+                    auth=(neo4j_cfg.user, neo4j_cfg.password),
+                    connection_timeout=10,
+                    connection_acquisition_timeout=10,
+                )
+                neo4j_driver.verify_connectivity()
+                app.state.neo4j_driver = neo4j_driver
+                app.state.neo4j_graph = Neo4jCausalGraph(neo4j_driver, database=neo4j_cfg.database)
+            except Exception as exc:
+                log.warning("Neo4j connection failed: %s", exc)
+                neo4j_driver = None
 
-            app.state.neo4j_driver = neo4j_driver
-            app.state.snowflake_client = SnowflakeClient(cfg.snowflake)
-            app.state.neo4j_graph = Neo4jCausalGraph(neo4j_driver, database=cfg.neo4j.database)
-            app.state.snowflake_details = SnowflakeDetails(app.state.snowflake_client)
-        except Exception as exc:
-            # Live credentials were present but the connection itself failed
-            # (wrong URI/creds, network/firewall block, instance paused, etc).
-            # Don't crash the whole API — degrade to demo mode instead.
-            log.warning("GitMind API started without live connectors: failed to connect — %s", exc)
+        if snowflake_cfg is not None:
+            try:
+                app.state.snowflake_client = SnowflakeClient(snowflake_cfg)
+                app.state.snowflake_details = SnowflakeDetails(app.state.snowflake_client)
+            except Exception as exc:
+                log.warning("Snowflake connection failed: %s", exc)
+
+        if not getattr(app.state, "neo4j_graph", None) and not getattr(app.state, "snowflake_details", None):
+            log.warning("GitMind API started without live connectors: both connections failed.")
             try:
                 set_runtime(GitMindRuntime.demo())
             except Exception:
                 pass
             return
 
-        # Wire the agent runtime using the already-open connections
-        try:
-            runtime = GitMindRuntime(
-                llm_config=cfg.llm,
-                neo4j_driver=neo4j_driver,
-                sf_client=app.state.snowflake_client,
-                use_placeholders=False,
+        # Wire the agent runtime using whatever live connections we got.
+        if llm_cfg is not None and neo4j_driver is not None:
+            try:
+                runtime = GitMindRuntime(
+                    llm_config=llm_cfg,
+                    neo4j_driver=neo4j_driver,
+                    sf_client=getattr(app.state, "snowflake_client", None),
+                    use_placeholders=False,
+                )
+                set_runtime(runtime)
+                app.state.gitmind_runtime = runtime
+                log.info("GitMind agent runtime initialised.")
+            except Exception as exc:
+                log.warning("Agent runtime init failed (non-fatal): %s", exc)
+                set_runtime(GitMindRuntime.demo())
+        else:
+            log.warning(
+                "Agent runtime not initialised (missing GOOGLE_API_KEY and/or Neo4j driver); "
+                "direct Neo4j/Snowflake queries may still work via /query's fallback path."
             )
-            set_runtime(runtime)
-            app.state.gitmind_runtime = runtime
-            log.info("GitMind agent runtime initialised.")
-        except Exception as exc:
-            log.warning("Agent runtime init failed (non-fatal): %s", exc)
-            # Fall back: set demo runtime so agent tools don't crash
             set_runtime(GitMindRuntime.demo())
 
     @app.on_event("shutdown")
