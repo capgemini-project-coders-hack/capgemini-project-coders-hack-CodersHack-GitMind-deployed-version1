@@ -505,6 +505,7 @@ def analyze_repository(repo_url):
     } catch(e) {
       container.textContent = `Failed to load: ${e}`;
     }
+  }
 
   async function loadFileExplorer() {
     const fileSelect = document.getElementById("fileSelect");
