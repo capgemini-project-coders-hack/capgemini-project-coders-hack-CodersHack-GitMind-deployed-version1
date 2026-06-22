@@ -493,22 +493,23 @@ def fetch_github_repo(payload: GitHubFetchRequest) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to list branches: {exc}")
 
+    branch_names = [b["name"] if isinstance(b, dict) else b for b in branches]
+
     result: dict[str, Any] = {
         "owner": owner,
         "repo": repo,
         "default_branch": default_branch,
-        "branches": branches,
+        "branches": branch_names,
         "commits": {},
     }
 
     # For each branch, fetch ALL commits (paginated) and their diffs
-    for b in branches:
+    for b_name in branch_names:
         try:
             if payload.include_file_previews:
-                # Full mode: fetch all commits with diffs (slow but complete)
-                commits = github_api.list_all_commits(owner, repo, b, token=token)
+                commits = github_api.list_all_commits(owner, repo, b_name, token=token)
             else:
-                commits = github_api.list_commits(owner, repo, b, per_page=payload.per_branch_limit, token=token)
+                commits = github_api.list_commits(owner, repo, b_name, per_page=payload.per_branch_limit, token=token)
         except Exception:
             commits = []
 
@@ -517,7 +518,6 @@ def fetch_github_repo(payload: GitHubFetchRequest) -> dict[str, Any]:
             sha = c.get("sha")
             try:
                 detail = github_api.get_commit_detail(owner, repo, sha, token=token)
-                # Truncate large patches for safety
                 for f in detail.get("files", []):
                     if f.get("patch") and len(f["patch"]) > 20000:
                         f["patch"] = f["patch"][:20000] + "\n...truncated..."
@@ -525,7 +525,7 @@ def fetch_github_repo(payload: GitHubFetchRequest) -> dict[str, Any]:
             except Exception:
                 detailed.append({"sha": sha, "error": "failed to fetch details"})
 
-        result["commits"][b] = detailed
+        result["commits"][b_name] = detailed
 
     return result
 
