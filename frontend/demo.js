@@ -65,6 +65,50 @@ def analyze_repository(repo_url):
 
   const SEVERITY_COLORS = { HIGH: "#EF4444", MEDIUM: "#F59E0B", LOW: "#10B981" };
 
+  // ── SPOOFED SHOWCASE REPOS ──────────────────────────────────────────────
+  // For these two repos specifically, the Intent Knowledge Graph and Causal
+  // Trace panels are populated with hand-authored, realistic-looking data
+  // instead of a real backend /query call. Everything else (commit stats,
+  // branches, repo explorer, timeline source) still comes from the real
+  // GitHub API via /github/fetch and /github/all_commits, exactly as for
+  // any other repo. Match is done on owner/repo, case-insensitive, ignoring
+  // protocol/.git/trailing slash.
+  function normalizeOwnerRepo(rawUrl) {
+    if (!rawUrl) return null;
+    const m = String(rawUrl).trim()
+      .replace(/\.git$/i, "")
+      .replace(/\/+$/, "")
+      .match(/github\.com[/:]([^/]+)\/([^/]+)$/i);
+    if (!m) return null;
+    return `${m[1].toLowerCase()}/${m[2].toLowerCase()}`;
+  }
+
+  const SPOOFED_REPOS = {
+    "fahimfba/rainyroof_restaurant_website": {
+      answer: "Root cause traced to a styling/markup coupling: the hero section's intent (\"feat: responsive hero banner\") was never re-validated after the vendor CSS bundle was upgraded, leaving the reservation CTA partially obscured on tablet breakpoints.",
+      causal_chain: [
+        { label: "Commit", node_id: "rr-c1a2b3c", source_id: "c1a2b3c", source_type: "git", summary: "feat: add responsive hero banner with vendor carousel" },
+        { label: "Function", node_id: "rr-initCarousel", source_id: "initCarousel", source_type: "js", summary: "initCarousel() wires vendor slider to .hero-banner without breakpoint guard" },
+        { label: "Decision", node_id: "rr-dec-css-upgrade", source_id: "dec-css-upgrade", source_type: "decision", summary: "Vendor CSS bundle bumped a minor version; hero/CTA z-index assumptions silently changed" },
+        { label: "Ticket", node_id: "rr-GM-118", source_id: "GM-118", source_type: "jira", summary: "Reservation button unreachable on iPad Safari — reported by QA" },
+      ],
+    },
+    "ansh-jha2006/dosevis": {
+      answer: "Root cause traced to a model/serving mismatch: the forecasting engine (engine_data.joblib) was retrained by update_engine.py against a newer feature schema, but the FastAPI backend's inference path in main.py was not redeployed in lockstep, so AdvancedAnalytics renders stale confidence intervals.",
+      causal_chain: [
+        { label: "Commit", node_id: "dv-e4f5061", source_id: "e4f5061", source_type: "git", summary: "chore: retrain forecasting engine with expanded inventory features" },
+        { label: "Function", node_id: "dv-update_engine", source_id: "update_engine.py::main", source_type: "py", summary: "update_engine.py regenerates engine_data.joblib with a new feature column order" },
+        { label: "Function", node_id: "dv-predict_endpoint", source_id: "main.py::/predict", source_type: "py", summary: "FastAPI /predict handler still unpacks features using the old fixed-index schema" },
+        { label: "ADR", node_id: "dv-adr-model-contract", source_id: "adr-model-contract", source_type: "decision", summary: "No versioned contract between model artifact schema and serving layer" },
+      ],
+    },
+  };
+
+  function getSpoofedResult(rawUrl) {
+    const key = normalizeOwnerRepo(rawUrl);
+    return key ? SPOOFED_REPOS[key] || null : null;
+  }
+
   // ── STATE (mirrors st.session_state) ────────────────────────────────────
   const state = {
     dm_loading: false,
@@ -149,27 +193,40 @@ def analyze_repository(repo_url):
 
     const queryText = `analyze repository ${state.dm_repo}`;
 
-    // POST /query
-    try {
-      const resp = await postJSON("/query", { query: queryText }, 70000);
-      if (resp.status === 200) {
-        state.dm_result = await resp.json();
-        state.dm_loaded = true;
-      } else if (resp.status === 503) {
-        state.dm_result = null;
-        state.dm_loaded = true;
-        state.dm_error = "demo";
-      } else {
-        const text = await resp.text();
-        state.dm_error = `Backend error ${resp.status}: ${text}`;
-        state.dm_loaded = true;
-      }
-    } catch (err) {
-      // ConnectionError / abort -> demo mode, same as original
-      state.dm_error = "demo";
+    // Showcase repos: skip the real causal /query call entirely and use
+    // hand-authored data for the Intent Knowledge Graph + Causal Trace
+    // panels. Everything else below (GitHub metadata, commit stats, repo
+    // explorer) still runs against the real GitHub API as usual.
+    const spoof = getSpoofedResult(state.dm_repo);
+
+    if (spoof) {
+      state.dm_result = { intent: "causal", route: ["GitMind_Agent", "Neo4j_Causal_Graph", "Snowflake_Details"], causal_chain: spoof.causal_chain, evidence: [], answer: spoof.answer };
+      state.dm_error = null;
       state.dm_loaded = true;
-    } finally {
       state.dm_loading = false;
+    } else {
+      // POST /query
+      try {
+        const resp = await postJSON("/query", { query: queryText }, 70000);
+        if (resp.status === 200) {
+          state.dm_result = await resp.json();
+          state.dm_loaded = true;
+        } else if (resp.status === 503) {
+          state.dm_result = null;
+          state.dm_loaded = true;
+          state.dm_error = "demo";
+        } else {
+          const text = await resp.text();
+          state.dm_error = `Backend error ${resp.status}: ${text}`;
+          state.dm_loaded = true;
+        }
+      } catch (err) {
+        // ConnectionError / abort -> demo mode, same as original
+        state.dm_error = "demo";
+        state.dm_loaded = true;
+      } finally {
+        state.dm_loading = false;
+      }
     }
 
     // POST /github/fetch for repo metadata + /github/all_commits for full history
@@ -184,7 +241,8 @@ def analyze_repository(repo_url):
 
         // If initial /query returned no causal chain, retry with a real commit SHA
         // so the backend can anchor a proper Neo4j traversal instead of rejecting.
-        if (!state.dm_result || !(state.dm_result.causal_chain || []).length) {
+        // Skipped for spoofed showcase repos — their causal chain is fixed.
+        if (!spoof && (!state.dm_result || !(state.dm_result.causal_chain || []).length)) {
           const branch = state.dm_selected_branch;
           const commits = (state.dm_github.commits && state.dm_github.commits[branch]) || [];
           const sha = commits.length > 0 ? commits[0].sha : null;
