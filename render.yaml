@@ -109,3 +109,65 @@ services:
       #   https://gitmind.vercel.app
       - key: CORS_ALLOWED_ORIGINS
         sync: false
+
+  # ---------------------------------------------------------------------
+  # Ingest job — THIS WAS MISSING. Without it, neither snowflake_etl.py
+  # nor neo4j_etl.py ever ran anywhere, which is why Snowflake/Neo4j
+  # stayed empty regardless of how correct the credentials were.
+  # Runs ingest/run_ingest.py (drives both ETL CLIs with --repo/--channel
+  # filled in from env). Same Docker image as the web service, separate
+  # Render Job so it doesn't block/delay the web service's /health check.
+  # Trigger manually the first time from the Render dashboard ("Run Job"),
+  # then set it to run on every deploy if you want it to auto-refresh.
+  # ---------------------------------------------------------------------
+  - type: job
+    name: gitmind-ingest
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile.backend
+    dockerContext: .
+    dockerCommand: "python -m ingest.run_ingest"
+    envVars:
+      - key: NEO4J_URI
+        sync: false
+      - key: NEO4J_USER
+        sync: false
+      - key: NEO4J_PASSWORD
+        sync: false
+      - key: NEO4J_DATABASE
+        value: neo4j
+      - key: SNOWFLAKE_ACCOUNT
+        sync: false
+      - key: SNOWFLAKE_USER
+        sync: false
+      - key: SNOWFLAKE_PASSWORD
+        sync: false
+      - key: SNOWFLAKE_WAREHOUSE
+        sync: false
+      - key: SNOWFLAKE_DATABASE
+        sync: false
+      - key: SNOWFLAKE_SCHEMA
+        value: PUBLIC
+      - key: SNOWFLAKE_ROLE
+        value: PUBLIC
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_ORG
+        sync: false
+      - key: GITHUB_DEFAULT_REPOS
+        sync: false
+      - key: JIRA_URL
+        sync: false
+      - key: JIRA_USER
+        sync: false
+      - key: JIRA_API_TOKEN
+        sync: false
+      - key: JIRA_DEFAULT_PROJECT
+        value: PLAT
+      - key: SLACK_BOT_TOKEN
+        sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
+      - key: SLACK_DEFAULT_CHANNELS
+        value: "#incidents,#engineering"
