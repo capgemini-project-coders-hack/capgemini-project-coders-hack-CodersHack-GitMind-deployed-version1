@@ -97,7 +97,7 @@ def check_chain_for_regressions(
         }
 
     genai.configure(api_key=api_key)
-    model_name = os.getenv("GITMIND_MODEL", "gemini-1.5-pro")
+    model_name = os.getenv("GITMIND_MODEL", "gemini-2.5-pro")
     model = genai.GenerativeModel(model_name)
     violations: list[dict[str, str]] = []
 
