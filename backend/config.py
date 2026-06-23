@@ -168,7 +168,7 @@ class GitHubConfig:
 @dataclass(frozen=True)
 class LLMConfig:
     api_key: str
-    model: str = "gemini-1.5-pro"
+    model: str = "gemini-2.5-pro"
     max_tokens: int = 4096
     temperature: float = 0.0
     max_agent_iterations: int = 10
@@ -177,7 +177,7 @@ class LLMConfig:
     def from_env(cls) -> "LLMConfig":
         return cls(
             api_key=_require_env("GOOGLE_API_KEY"),
-            model=_optional_env("GITMIND_MODEL", "gemini-1.5-pro"),
+            model=_optional_env("GITMIND_MODEL", "gemini-2.5-pro"),
             max_tokens=int(_optional_env("GITMIND_MAX_TOKENS", "4096")),
             temperature=float(_optional_env("GITMIND_TEMPERATURE", "0")),
             max_agent_iterations=int(_optional_env("GITMIND_MAX_ITERATIONS", "10")),
