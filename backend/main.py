@@ -152,7 +152,11 @@ def enrich_identifiers(payload: GitMindQuery) -> GitMindQuery:
             data.ticket_id = ticket.group(0)
 
     if not data.entity_id and data.ticket_id:
-        data.entity_id = f"ticket:{data.ticket_id}"
+        # Ticket nodes are MERGEd in neo4j_etl.py with `id` = the raw Jira
+        # key (e.g. "PLAT-123"), not a "ticket:"-prefixed value, so the
+        # entity_id used for the `{id: $entity_id}` Cypher match must match
+        # that exactly or the trace silently returns nothing.
+        data.entity_id = data.ticket_id
 
     if not data.entity_id:
         commit = re.search(r"\b[0-9a-f]{7,40}\b", text, flags=re.IGNORECASE)
@@ -371,7 +375,12 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
     if graph is None and snowflake is None:
         # Full demo mode — let agent run with placeholders, skip DB calls
         try:
-            agent_result = agent_debug(payload.query)
+            agent_result = agent_debug(
+                payload.query,
+                entity_id=payload.entity_id,
+                function_name=payload.function_name,
+                ticket_id=payload.ticket_id,
+            )
             return GitMindQueryResponse(
                 intent=classify_intent(payload.query),
                 route=["GitMind_Agent_Demo"],
@@ -405,8 +414,13 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
 
         # Primary path: run the full LLM agent
         try:
-            agent_result = agent_debug(enriched.query)
-            chain = graph.trace(
+            agent_result = agent_debug(
+                enriched.query,
+                entity_id=enriched.entity_id,
+                function_name=enriched.function_name,
+                ticket_id=enriched.ticket_id,
+            )
+            chain = agent_result.get("causal_chain") or graph.trace(
                 entity_id=enriched.entity_id,
                 function_name=enriched.function_name,
                 ticket_id=enriched.ticket_id,
@@ -855,6 +869,7 @@ def create_app() -> FastAPI:
                     neo4j_driver=neo4j_driver,
                     sf_client=getattr(app.state, "snowflake_client", None),
                     use_placeholders=False,
+                    neo4j_database=neo4j_cfg.database if neo4j_cfg else "neo4j",
                 )
                 set_runtime(runtime)
                 app.state.gitmind_runtime = runtime
