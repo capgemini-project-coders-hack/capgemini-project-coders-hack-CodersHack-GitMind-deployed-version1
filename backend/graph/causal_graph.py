@@ -108,5 +108,9 @@ class Neo4jCausalGraph:
         if function_name:
             return "{name: $function_name}", {"function_name": function_name}
         if ticket_id:
-            return "{ticket_id: $ticket_id}", {"ticket_id": ticket_id}
+            # Ticket nodes are MERGEd (see ingest/neo4j_etl.py) with `id` set
+            # to the raw Jira key — there is no separate `ticket_id`
+            # property on any node, so matching on it would always return
+            # zero results.
+            return "{id: $ticket_id}", {"ticket_id": ticket_id}
         return None, {}
