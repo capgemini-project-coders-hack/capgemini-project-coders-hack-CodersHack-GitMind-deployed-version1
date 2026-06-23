@@ -1,0 +1,624 @@
+"""
+neo4j_etl.py — Graph ingestion pipeline for GitMind's Neo4j store
+==================================================================
+Creates nodes and causal edges consumed by Neo4jCausalGraph.trace() in
+causal_graph.py. Mirrors the same six entity types as snowflake_etl.py,
+then wires them together with the relationship types already hard-coded
+in causal_graph.py:
+
+  CAUSED_BY | INFLUENCED_BY | REFERENCES | SHAPES | DISCUSSED_IN | GOVERNED_BY
+
+Node labels created:
+  Commit  · Ticket  · SlackMessage  · ADR  · BugReport  · Decision
+
+USAGE
+-----
+  # Full pipeline (pull from APIs → ingest into Neo4j)
+  python neo4j_etl.py
+
+  # Individual steps
+  python neo4j_etl.py --step constraints
+  python neo4j_etl.py --step commits   --repo owner/repo
+  python neo4j_etl.py --step tickets
+  python neo4j_etl.py --step messages  --channel C0XXXXXX
+  python neo4j_etl.py --step adrs      --repo owner/repo
+  python neo4j_etl.py --step bugs      --input bugs.json
+  python neo4j_etl.py --step decisions --input decisions.json
+  python neo4j_etl.py --step edges
+
+ENVIRONMENT VARIABLES
+---------------------
+  NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, NEO4J_DATABASE
+  GITHUB_TOKEN, JIRA_URL, JIRA_USER, JIRA_API_TOKEN, JIRA_DEFAULT_PROJECT
+  SLACK_BOT_TOKEN
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Any
+
+log = logging.getLogger("gitmind.etl.neo4j")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
+
+
+# ---------------------------------------------------------------------------
+# Connection
+# ---------------------------------------------------------------------------
+
+def _get_driver():
+    from neo4j import GraphDatabase
+    uri      = _require("NEO4J_URI")
+    user     = _require("NEO4J_USER")
+    password = _require("NEO4J_PASSWORD")
+    driver   = GraphDatabase.driver(uri, auth=(user, password))
+    driver.verify_connectivity()
+    log.info("Connected to Neo4j at %s", uri)
+    return driver
+
+
+def _require(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        raise EnvironmentError(f"Required env var '{name}' is not set.")
+    return val
+
+
+def _db(driver) -> str:
+    return os.getenv("NEO4J_DATABASE", "neo4j")
+
+
+def _run(session, cypher: str, **params) -> list[dict]:
+    result = session.run(cypher, **params)
+    return [dict(r) for r in result]
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Constraints & indexes
+# ---------------------------------------------------------------------------
+
+CONSTRAINTS = [
+    ("Commit",       "id"),
+    ("Ticket",       "id"),
+    ("SlackMessage", "id"),
+    ("ADR",          "id"),
+    ("BugReport",    "id"),
+    ("Decision",     "id"),
+]
+
+def run_constraints(driver) -> None:
+    log.info("Creating uniqueness constraints...")
+    with driver.session(database=_db(driver)) as session:
+        for label, prop in CONSTRAINTS:
+            cypher = (
+                f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) "
+                f"REQUIRE n.{prop} IS UNIQUE"
+            )
+            session.run(cypher)
+        # Extra indexes for common traversal properties
+        session.run("CREATE INDEX IF NOT EXISTS FOR (n:Commit)       ON (n.repo)")
+        session.run("CREATE INDEX IF NOT EXISTS FOR (n:Ticket)       ON (n.project)")
+        session.run("CREATE INDEX IF NOT EXISTS FOR (n:BugReport)    ON (n.ticket_ref)")
+        session.run("CREATE INDEX IF NOT EXISTS FOR (n:Decision)     ON (n.related_ticket)")
+    log.info("Constraints + indexes done.")
+
+
+# ---------------------------------------------------------------------------
+# Helper: MERGE a node
+# ---------------------------------------------------------------------------
+
+def _merge_node(session, label: str, node_id: str, props: dict) -> None:
+    """MERGE on (label {id: node_id}), SET all other props."""
+    set_clause = ", ".join(f"n.{k} = ${k}" for k in props)
+    cypher = f"""
+        MERGE (n:{label} {{id: $node_id}})
+        SET n.node_id = $node_id,
+            n.source_type = '{label}',
+            n.source_id = $node_id
+            {", " + set_clause if set_clause else ""}
+    """
+    session.run(cypher, node_id=node_id, **props)
+
+
+def _merge_rel(session, from_id: str, from_label: str,
+               rel: str, to_id: str, to_label: str, props: dict | None = None) -> None:
+    """MERGE a directed relationship between two already-existing nodes."""
+    prop_str = ""
+    if props:
+        prop_str = " {" + ", ".join(f"{k}: ${k}" for k in props) + "}"
+    cypher = f"""
+        MATCH (a:{from_label} {{id: $from_id}})
+        MATCH (b:{to_label}   {{id: $to_id}})
+        MERGE (a)-[r:{rel}{prop_str}]->(b)
+    """
+    session.run(cypher, from_id=from_id, to_id=to_id, **(props or {}))
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Commits
+# ---------------------------------------------------------------------------
+
+def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10) -> None:
+    import requests
+
+    token   = os.getenv("GITHUB_TOKEN")
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    owner, repo_name = repo.split("/", 1)
+    log.info("Fetching commits from %s @ %s...", repo, branch)
+
+    all_commits: list[dict] = []
+    for page in range(1, max_pages + 1):
+        resp = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo_name}/commits",
+            params={"sha": branch, "per_page": 100, "page": page},
+            headers=headers, timeout=30,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        all_commits.extend(batch)
+        if len(batch) < 100:
+            break
+
+    log.info("  Merging %d Commit nodes...", len(all_commits))
+    with driver.session(database=_db(driver)) as session:
+        for c in all_commits:
+            sha         = c["sha"]
+            commit_data = c.get("commit", {})
+            author_data = commit_data.get("author") or {}
+            message     = commit_data.get("message", "")
+            ts_raw      = author_data.get("date", "")
+
+            _merge_node(session, "Commit", sha, {
+                "repo":      repo,
+                "branch":    branch,
+                "author":    (c.get("author") or {}).get("login") or author_data.get("name", ""),
+                "message":   message[:2000],
+                "summary":   message.split("\n")[0][:500],
+                "timestamp": ts_raw,
+                "url":       c.get("html_url", ""),
+            })
+
+    log.info("  Done — %d Commit nodes merged.", len(all_commits))
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Tickets
+# ---------------------------------------------------------------------------
+
+def ingest_tickets(driver, project: str | None = None, max_results: int = 5000) -> None:
+    import requests
+    from requests.auth import HTTPBasicAuth
+
+    jira_url   = _require("JIRA_URL").rstrip("/")
+    jira_user  = _require("JIRA_USER")
+    jira_token = _require("JIRA_API_TOKEN")
+    project    = project or os.getenv("JIRA_DEFAULT_PROJECT", "PLAT")
+    auth       = HTTPBasicAuth(jira_user, jira_token)
+
+    log.info("Fetching Jira tickets for project %s...", project)
+
+    start_at   = 0
+    batch_size = 100
+    inserted   = 0
+
+    while start_at < max_results:
+        resp = requests.get(
+            f"{jira_url}/rest/api/3/search",
+            params={
+                "jql":        f"project={project} ORDER BY created DESC",
+                "startAt":    start_at,
+                "maxResults": batch_size,
+                "fields":     "summary,description,status,priority,issuetype,"
+                              "assignee,reporter,created,updated,resolutiondate,labels",
+            },
+            auth=auth, timeout=30,
+        )
+        resp.raise_for_status()
+        issues = resp.json().get("issues", [])
+        if not issues:
+            break
+
+        with driver.session(database=_db(driver)) as session:
+            for issue in issues:
+                key    = issue["key"]
+                fields = issue.get("fields", {})
+
+                def _text(obj, *keys):
+                    for k in keys:
+                        obj = (obj or {}).get(k)
+                    return obj or ""
+
+                desc_raw  = fields.get("description")
+                desc_text = _adf_to_text(desc_raw) if isinstance(desc_raw, dict) else (desc_raw or "")
+                issue_type = _text(fields.get("issuetype"), "name")
+                label     = "BugReport" if issue_type.lower() in ("bug", "incident", "defect") else "Ticket"
+
+                _merge_node(session, "Ticket", key, {
+                    "project":    project,
+                    "summary":    fields.get("summary", "")[:1000],
+                    "text":       desc_text[:4000],
+                    "status":     _text(fields.get("status"), "name"),
+                    "priority":   _text(fields.get("priority"), "name"),
+                    "issue_type": issue_type,
+                    "assignee":   _text(fields.get("assignee"), "displayName"),
+                    "created_at": fields.get("created", ""),
+                    "url":        f"{jira_url}/browse/{key}",
+                    "is_bug":     label == "BugReport",
+                })
+
+                # Also create a BugReport node for bug-type issues
+                if label == "BugReport":
+                    _merge_node(session, "BugReport", f"bug:{key}", {
+                        "ticket_ref":  key,
+                        "title":       fields.get("summary", "")[:500],
+                        "summary":     desc_text[:2000],
+                        "severity":    _text(fields.get("priority"), "name"),
+                        "status":      _text(fields.get("status"), "name"),
+                        "reported_at": fields.get("created", ""),
+                    })
+                    # BugReport -[REFERENCES]-> Ticket
+                    _merge_rel(session, f"bug:{key}", "BugReport", "REFERENCES", key, "Ticket")
+
+                inserted += 1
+
+        start_at += len(issues)
+        if len(issues) < batch_size:
+            break
+
+    log.info("  Merged %d Ticket nodes.", inserted)
+
+
+def _adf_to_text(adf: dict) -> str:
+    parts = []
+    for node in adf.get("content", []):
+        if node.get("type") == "paragraph":
+            for inline in node.get("content", []):
+                if inline.get("type") == "text":
+                    parts.append(inline.get("text", ""))
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Slack → SlackMessage nodes
+# ---------------------------------------------------------------------------
+
+def ingest_messages(driver, channel_id: str, limit_days: int = 90) -> None:
+    import requests
+
+    token   = _require("SLACK_BOT_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    channel_name = channel_id
+    try:
+        info = requests.get(
+            "https://slack.com/api/conversations.info",
+            params={"channel": channel_id}, headers=headers, timeout=15,
+        ).json()
+        channel_name = info.get("channel", {}).get("name", channel_id)
+    except Exception:
+        pass
+
+    log.info("Fetching Slack messages from #%s...", channel_name)
+
+    oldest = str(time.time() - limit_days * 86400)
+    cursor = None
+    inserted = 0
+
+    while True:
+        params: dict[str, Any] = {"channel": channel_id, "limit": 200, "oldest": oldest}
+        if cursor:
+            params["cursor"] = cursor
+
+        resp = requests.get(
+            "https://slack.com/api/conversations.history",
+            params=params, headers=headers, timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not data.get("ok"):
+            log.error("Slack error: %s", data.get("error"))
+            break
+
+        with driver.session(database=_db(driver)) as session:
+            for msg in data.get("messages", []):
+                msg_id = f"{channel_id}:{msg['ts']}"
+                ts_dt  = datetime.fromtimestamp(float(msg.get("ts", 0)), tz=timezone.utc)
+
+                _merge_node(session, "SlackMessage", msg_id, {
+                    "channel_id":   channel_id,
+                    "channel_name": channel_name,
+                    "user_id":      msg.get("user", ""),
+                    "text":         msg.get("text", "")[:2000],
+                    "summary":      msg.get("text", "")[:300],
+                    "timestamp":    ts_dt.isoformat(),
+                    "thread_ts":    msg.get("thread_ts", ""),
+                })
+                inserted += 1
+
+        meta   = data.get("response_metadata", {})
+        cursor = meta.get("next_cursor")
+        if not cursor:
+            break
+
+    log.info("  Merged %d SlackMessage nodes from #%s.", inserted, channel_name)
+
+
+# ---------------------------------------------------------------------------
+# Step 5: ADRs → ADR nodes
+# ---------------------------------------------------------------------------
+
+def ingest_adrs(driver, repo: str, adr_path: str = "docs/adr") -> None:
+    import re, base64, requests
+
+    token   = os.getenv("GITHUB_TOKEN")
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    owner, repo_name = repo.split("/", 1)
+    log.info("Scanning %s/%s for ADRs in '%s'...", owner, repo_name, adr_path)
+
+    resp = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/contents/{adr_path}",
+        headers=headers, timeout=15,
+    )
+    if not resp.ok:
+        log.warning("  ADR path not found in %s (%s).", repo, resp.status_code)
+        return
+
+    files = [f for f in resp.json() if f.get("name", "").endswith(".md")]
+    log.info("  Found %d ADR files.", len(files))
+
+    inserted = 0
+    with driver.session(database=_db(driver)) as session:
+        for f in files:
+            content_resp = requests.get(f["url"], headers=headers, timeout=15)
+            if not content_resp.ok:
+                continue
+            raw   = base64.b64decode(content_resp.json().get("content", "")).decode("utf-8", errors="replace")
+            title = _extract_section(raw, r"^#\s+(.+)$") or f["name"]
+            status = _extract_section(raw, r"[Ss]tatus[:\s]+(.+)")
+
+            date_match   = re.search(r"(\d{4}-\d{2}-\d{2})", f["name"])
+            created_date = date_match.group(1) if date_match else ""
+
+            adr_id = f"{repo}/{f['path']}"
+            _merge_node(session, "ADR", adr_id, {
+                "repo":         repo,
+                "file_path":    f["path"],
+                "title":        title[:500],
+                "summary":      title[:500],
+                "status":       (status or "")[:50],
+                "created_date": created_date,
+                "text":         raw[:4000],
+            })
+            inserted += 1
+
+    log.info("  Merged %d ADR nodes.", inserted)
+
+
+def _extract_section(text: str, pattern: str) -> str:
+    import re
+    m = re.search(pattern, text, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+# ---------------------------------------------------------------------------
+# Step 6: JSON feeds → BugReport / Decision nodes
+# ---------------------------------------------------------------------------
+
+def ingest_bugs_from_file(driver, path: str) -> None:
+    with open(path) as f:
+        bugs: list[dict] = json.load(f)
+
+    inserted = 0
+    with driver.session(database=_db(driver)) as session:
+        for bug in bugs:
+            bid = bug["bug_id"]
+            _merge_node(session, "BugReport", bid, {
+                "title":       bug.get("title", "")[:500],
+                "summary":     bug.get("description", "")[:1000],
+                "severity":    bug.get("severity", ""),
+                "status":      bug.get("status", ""),
+                "ticket_ref":  bug.get("ticket_ref", ""),
+                "commit_ref":  bug.get("commit_ref", ""),
+                "reported_at": bug.get("reported_at", ""),
+            })
+            inserted += 1
+
+    log.info("Merged %d BugReport nodes from %s.", inserted, path)
+
+
+def ingest_decisions_from_file(driver, path: str) -> None:
+    with open(path) as f:
+        decisions: list[dict] = json.load(f)
+
+    inserted = 0
+    with driver.session(database=_db(driver)) as session:
+        for dec in decisions:
+            did = dec["decision_id"]
+            _merge_node(session, "Decision", did, {
+                "title":          dec.get("title", "")[:500],
+                "summary":        (dec.get("rationale") or dec.get("title", ""))[:1000],
+                "outcome":        dec.get("outcome", "")[:500],
+                "owner":          dec.get("owner", ""),
+                "related_ticket": dec.get("related_ticket", ""),
+                "related_commit": dec.get("related_commit", ""),
+                "timestamp":      dec.get("timestamp", ""),
+            })
+            inserted += 1
+
+    log.info("Merged %d Decision nodes from %s.", inserted, path)
+
+
+# ---------------------------------------------------------------------------
+# Step 7: Wire edges
+# ---------------------------------------------------------------------------
+
+def build_edges(driver) -> None:
+    """
+    Infer relationships between existing nodes from shared identifiers
+    (ticket refs in commit messages, commit SHAs in bug reports, etc.)
+    and create the causal edges that Neo4jCausalGraph.trace() traverses.
+    """
+    log.info("Building edges between nodes...")
+    with driver.session(database=_db(driver)) as session:
+
+        # Commit message references a Jira ticket  → Commit -[REFERENCES]-> Ticket
+        session.run("""
+            MATCH (c:Commit), (t:Ticket)
+            WHERE c.message =~ ('(?i).*' + t.id + '.*')
+              AND NOT (c)-[:REFERENCES]->(t)
+            MERGE (c)-[:REFERENCES]->(t)
+        """)
+        log.info("  Commit -[REFERENCES]-> Ticket: done")
+
+        # BugReport references a commit  → BugReport -[CAUSED_BY]-> Commit
+        session.run("""
+            MATCH (b:BugReport), (c:Commit)
+            WHERE b.commit_ref = c.id
+              AND b.commit_ref <> ''
+              AND NOT (b)-[:CAUSED_BY]->(c)
+            MERGE (b)-[:CAUSED_BY]->(c)
+        """)
+        log.info("  BugReport -[CAUSED_BY]-> Commit: done")
+
+        # BugReport references a Ticket  → already created inline; ensure symmetric link
+        session.run("""
+            MATCH (b:BugReport), (t:Ticket)
+            WHERE b.ticket_ref = t.id
+              AND b.ticket_ref <> ''
+              AND NOT (b)-[:REFERENCES]->(t)
+            MERGE (b)-[:REFERENCES]->(t)
+        """)
+        log.info("  BugReport -[REFERENCES]-> Ticket: done")
+
+        # Decision governs a Ticket  → Decision -[GOVERNED_BY]-> Ticket
+        session.run("""
+            MATCH (d:Decision), (t:Ticket)
+            WHERE d.related_ticket = t.id
+              AND d.related_ticket <> ''
+              AND NOT (d)-[:GOVERNED_BY]->(t)
+            MERGE (d)-[:GOVERNED_BY]->(t)
+        """)
+        log.info("  Decision -[GOVERNED_BY]-> Ticket: done")
+
+        # Decision shaped a Commit  → Decision -[SHAPES]-> Commit
+        session.run("""
+            MATCH (d:Decision), (c:Commit)
+            WHERE d.related_commit = c.id
+              AND d.related_commit <> ''
+              AND NOT (d)-[:SHAPES]->(c)
+            MERGE (d)-[:SHAPES]->(c)
+        """)
+        log.info("  Decision -[SHAPES]-> Commit: done")
+
+        # ADR governs Decisions (link by project/title keyword overlap — best effort)
+        session.run("""
+            MATCH (a:ADR), (d:Decision)
+            WHERE a.repo IS NOT NULL
+              AND d.title IS NOT NULL
+              AND toLower(d.title) CONTAINS toLower(split(a.title, ':')[0])
+              AND NOT (a)-[:GOVERNED_BY]->(d)
+            MERGE (a)-[:GOVERNED_BY]->(d)
+        """)
+        log.info("  ADR -[GOVERNED_BY]-> Decision: done (keyword match)")
+
+        # SlackMessage discusses a Ticket  → SlackMessage -[DISCUSSED_IN]-> Ticket
+        session.run("""
+            MATCH (m:SlackMessage), (t:Ticket)
+            WHERE m.text =~ ('(?i).*' + t.id + '.*')
+              AND NOT (m)-[:DISCUSSED_IN]->(t)
+            MERGE (m)-[:DISCUSSED_IN]->(t)
+        """)
+        log.info("  SlackMessage -[DISCUSSED_IN]-> Ticket: done")
+
+        # SlackMessage discusses a Commit (SHA mention)
+        session.run("""
+            MATCH (m:SlackMessage), (c:Commit)
+            WHERE m.text =~ ('(?i).*' + left(c.id, 7) + '.*')
+              AND NOT (m)-[:DISCUSSED_IN]->(c)
+            MERGE (m)-[:DISCUSSED_IN]->(c)
+        """)
+        log.info("  SlackMessage -[DISCUSSED_IN]-> Commit: done")
+
+    log.info("Edge building complete.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="GitMind Neo4j ETL")
+    parser.add_argument("--step", default="all",
+        choices=["all", "constraints", "commits", "tickets", "messages",
+                 "adrs", "bugs", "decisions", "edges"])
+    parser.add_argument("--repo",     help="owner/repo for commits and ADRs")
+    parser.add_argument("--branch",   default="main")
+    parser.add_argument("--channel",  help="Slack channel ID")
+    parser.add_argument("--adr-path", default="docs/adr")
+    parser.add_argument("--project",  help="Jira project key")
+    parser.add_argument("--input",    help="JSON file for bugs/decisions step")
+    args = parser.parse_args(argv)
+
+    try:
+        driver = _get_driver()
+    except Exception as exc:
+        log.error("Cannot connect to Neo4j: %s", exc)
+        return 1
+
+    try:
+        step = args.step
+        if step in ("all", "constraints"):
+            run_constraints(driver)
+        if step in ("all", "commits"):
+            if not args.repo:
+                log.error("--repo required for commits step")
+                return 1
+            ingest_commits(driver, args.repo, branch=args.branch)
+        if step in ("all", "tickets"):
+            ingest_tickets(driver, project=args.project)
+        if step in ("all", "messages"):
+            if not args.channel:
+                log.error("--channel required for messages step")
+                return 1
+            ingest_messages(driver, args.channel)
+        if step in ("all", "adrs"):
+            if not args.repo:
+                log.error("--repo required for adrs step")
+                return 1
+            ingest_adrs(driver, args.repo, adr_path=args.adr_path)
+        if step == "bugs":
+            if not args.input:
+                log.error("--input required for bugs step")
+                return 1
+            ingest_bugs_from_file(driver, args.input)
+        if step == "decisions":
+            if not args.input:
+                log.error("--input required for decisions step")
+                return 1
+            ingest_decisions_from_file(driver, args.input)
+        if step in ("all", "edges"):
+            build_edges(driver)
+    finally:
+        driver.close()
+
+    log.info("ETL done.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
