@@ -34,6 +34,28 @@ def _first(csv_env: str) -> str:
     return parts[0] if parts else ""
 
 
+def _run_step(label: str, fn, argv: list[str]) -> int:
+    """Run one ETL CLI invocation, catching anything it raises.
+
+    Neither snowflake_etl.main() nor neo4j_etl.main() catch exceptions
+    raised inside their own step logic — they only have a `finally` to
+    close the connection. Left uncaught here, one bad step (e.g. GitHub
+    rate-limited, a malformed repo string) would kill this whole script
+    and silently skip every step after it — including the entire Neo4j
+    half, which is exactly the "no data, no graph" failure this is meant
+    to fix. Catching per-step keeps one failure from taking out the rest.
+    """
+    log.info("=== %s ===", label)
+    try:
+        rc = fn(argv)
+        if rc:
+            log.error("%s exited with code %s", label, rc)
+        return rc or 0
+    except Exception as exc:  # noqa: BLE001 - isolate, log, keep going
+        log.error("%s raised an uncaught exception: %s", label, exc, exc_info=True)
+        return 1
+
+
 def main() -> int:
     repo = os.environ.get("GITMIND_INGEST_REPO") or _first("GITHUB_DEFAULT_REPOS")
     channel = os.environ.get("GITMIND_INGEST_CHANNEL") or _first("SLACK_DEFAULT_CHANNELS")
@@ -61,37 +83,26 @@ def main() -> int:
     # --- Snowflake -----------------------------------------------------
     from ingest import snowflake_etl
 
-    log.info("=== Snowflake ETL: ddl ===")
-    overall_rc |= snowflake_etl.main(["--step", "ddl"])
-    log.info("=== Snowflake ETL: commits ===")
-    overall_rc |= snowflake_etl.main(["--step", "commits", *base_args])
-    log.info("=== Snowflake ETL: tickets ===")
-    overall_rc |= snowflake_etl.main(["--step", "tickets", *base_args])
+    overall_rc |= _run_step("Snowflake ETL: ddl", snowflake_etl.main, ["--step", "ddl"])
+    overall_rc |= _run_step("Snowflake ETL: commits", snowflake_etl.main, ["--step", "commits", *base_args])
+    overall_rc |= _run_step("Snowflake ETL: tickets", snowflake_etl.main, ["--step", "tickets", *base_args])
     if channel:
-        log.info("=== Snowflake ETL: messages ===")
-        overall_rc |= snowflake_etl.main(["--step", "messages", "--channel", channel])
-    log.info("=== Snowflake ETL: adrs ===")
-    overall_rc |= snowflake_etl.main(["--step", "adrs", *base_args])
+        overall_rc |= _run_step("Snowflake ETL: messages", snowflake_etl.main, ["--step", "messages", "--channel", channel])
+    overall_rc |= _run_step("Snowflake ETL: adrs", snowflake_etl.main, ["--step", "adrs", *base_args])
 
     # --- Neo4j -----------------------------------------------------------
     from ingest import neo4j_etl
 
-    log.info("=== Neo4j ETL: constraints ===")
-    overall_rc |= neo4j_etl.main(["--step", "constraints"])
-    log.info("=== Neo4j ETL: commits ===")
-    overall_rc |= neo4j_etl.main(["--step", "commits", *base_args])
-    log.info("=== Neo4j ETL: tickets ===")
-    overall_rc |= neo4j_etl.main(["--step", "tickets", *base_args])
+    overall_rc |= _run_step("Neo4j ETL: constraints", neo4j_etl.main, ["--step", "constraints"])
+    overall_rc |= _run_step("Neo4j ETL: commits", neo4j_etl.main, ["--step", "commits", *base_args])
+    overall_rc |= _run_step("Neo4j ETL: tickets", neo4j_etl.main, ["--step", "tickets", *base_args])
     if channel:
-        log.info("=== Neo4j ETL: messages ===")
-        overall_rc |= neo4j_etl.main(["--step", "messages", "--channel", channel])
-    log.info("=== Neo4j ETL: adrs ===")
-    overall_rc |= neo4j_etl.main(["--step", "adrs", *base_args])
-    log.info("=== Neo4j ETL: edges ===")
-    overall_rc |= neo4j_etl.main(["--step", "edges"])
+        overall_rc |= _run_step("Neo4j ETL: messages", neo4j_etl.main, ["--step", "messages", "--channel", channel])
+    overall_rc |= _run_step("Neo4j ETL: adrs", neo4j_etl.main, ["--step", "adrs", *base_args])
+    overall_rc |= _run_step("Neo4j ETL: edges", neo4j_etl.main, ["--step", "edges"])
 
     if overall_rc:
-        log.error("One or more ETL steps failed — see logs above. Exiting non-zero.")
+        log.error("One or more ETL steps failed — see logs above for which ones. Exiting non-zero.")
     else:
         log.info("Ingest complete: Snowflake + Neo4j both populated.")
     return overall_rc
