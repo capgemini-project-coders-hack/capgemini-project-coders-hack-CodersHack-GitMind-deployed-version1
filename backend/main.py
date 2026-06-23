@@ -188,7 +188,17 @@ def infer_table(query: str, explicit_table: str = "") -> str:
         return "BUG_REPORTS"
     if "decision" in lowered:
         return "DECISIONS"
-    return "DECISIONS"
+    # BUG FIX: this used to fall back to "DECISIONS". DECISIONS is only
+    # populated from ADR files / a manually-fed JSON decision log (see
+    # ingest/snowflake_etl.py Step 6) -- it is NOT populated by the normal
+    # GitHub commit/ticket/message ingestion. Every other repo-level query
+    # (e.g. the frontend's auto-generated "analyze repository <url>" probe,
+    # which contains none of the keywords above) was silently routed to
+    # this near-always-empty table, producing "Returned 0 row(s) from
+    # DECISIONS" even when COMMITS/TICKETS/MESSAGES were fully ingested.
+    # COMMITS is the one table guaranteed to have rows for any ingested
+    # repo, so it's the correct default for an unrecognised query.
+    return "COMMITS"
 
 
 def summarize_chain(chain: list[GraphPathNode], evidence: list[dict[str, Any]]) -> str:
