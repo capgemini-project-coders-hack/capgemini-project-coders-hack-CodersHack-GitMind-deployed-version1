@@ -53,7 +53,7 @@ services:
       - key: GOOGLE_API_KEY
         sync: false
       - key: GITMIND_MODEL
-        value: gemini-1.5-pro
+        value: gemini-2.5-pro
       - key: GITMIND_MAX_TOKENS
         value: "4096"
       - key: GITMIND_TEMPERATURE
