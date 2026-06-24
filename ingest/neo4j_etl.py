@@ -25,6 +25,7 @@ USAGE
   python neo4j_etl.py --step bugs      --input bugs.json
   python neo4j_etl.py --step decisions --input decisions.json
   python neo4j_etl.py --step edges
+  python neo4j_etl.py --step reset      # wipe all nodes/edges
 
 ENVIRONMENT VARIABLES
 ---------------------
@@ -77,6 +78,32 @@ def _db(driver) -> str:
 def _run(session, cypher: str, **params) -> list[dict]:
     result = session.run(cypher, **params)
     return [dict(r) for r in result]
+
+
+# ---------------------------------------------------------------------------
+# Step 0: Reset — wipe every node + relationship. Called on frontend refresh
+# / repo switch so a new repo's graph never overlaps the previous one. Runs
+# in batches via apoc-free `CALL { } IN TRANSACTIONS` (Neo4j 5+) so it won't
+# OOM on large graphs; falls back to a plain DETACH DELETE if that syntax
+# isn't supported on the connected server version.
+# ---------------------------------------------------------------------------
+
+def reset_all(driver=None) -> None:
+    own_driver = driver is None
+    driver = driver or _get_driver()
+    try:
+        with driver.session(database=_db(driver)) as session:
+            try:
+                session.run("""
+                    MATCH (n)
+                    CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 1000 ROWS
+                """)
+            except Exception:
+                session.run("MATCH (n) DETACH DELETE n")
+        log.info("Neo4j reset complete — all nodes and relationships wiped.")
+    finally:
+        if own_driver:
+            driver.close()
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +172,7 @@ def _merge_rel(session, from_id: str, from_label: str,
 # ---------------------------------------------------------------------------
 
 def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10) -> None:
+    # max_pages=10 * per_page=100 = 1000 commits cap (rolled back from 50/5000).
     import requests
 
     token   = os.getenv("GITHUB_TOKEN")
@@ -153,7 +181,8 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
         headers["Authorization"] = f"Bearer {token}"
 
     owner, repo_name = repo.split("/", 1)
-    log.info("Fetching commits from %s @ %s...", repo, branch)
+    log.info("Fetching commits from %s @ %s (max %d pages / %d commits)...",
+              repo, branch, max_pages, max_pages * 100)
 
     all_commits: list[dict] = []
     for page in range(1, max_pages + 1):
@@ -574,14 +603,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GitMind Neo4j ETL")
     parser.add_argument("--step", default="all",
         choices=["all", "constraints", "commits", "tickets", "messages",
-                 "adrs", "bugs", "decisions", "edges"])
+                 "adrs", "bugs", "decisions", "edges", "reset"])
     parser.add_argument("--repo",     help="owner/repo for commits and ADRs")
     parser.add_argument("--branch",   default="main")
     parser.add_argument("--channel",  help="Slack channel ID")
     parser.add_argument("--adr-path", default="docs/adr")
     parser.add_argument("--project",  help="Jira project key")
     parser.add_argument("--input",    help="JSON file for bugs/decisions step")
+    parser.add_argument("--max-pages", type=int, default=10,
+                        help="GitHub commit pages to fetch (10 pages * 100/page = 1000 commits)")
     args = parser.parse_args(argv)
+
+    if args.step == "reset":
+        try:
+            reset_all()
+        except Exception as exc:
+            log.error("Cannot reset Neo4j: %s", exc)
+            return 1
+        log.info("ETL done.")
+        return 0
 
     try:
         driver = _get_driver()
@@ -597,7 +637,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.repo:
                 log.error("--repo required for commits step")
                 return 1
-            ingest_commits(driver, args.repo, branch=args.branch)
+            ingest_commits(driver, args.repo, branch=args.branch, max_pages=args.max_pages)
         if step in ("all", "tickets"):
             ingest_tickets(driver, project=args.project)
         if step in ("all", "messages"):
