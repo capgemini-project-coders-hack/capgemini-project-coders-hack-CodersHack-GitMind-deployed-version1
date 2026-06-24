@@ -376,18 +376,25 @@ def ingest_tickets(conn, project: str | None = None, max_results: int = 5000) ->
     start_at = 0
     batch_size = 100
     tickets_inserted = bugs_inserted = 0
+    next_page_token = None
 
-    while start_at < max_results:
+    while True:
+        params = {
+            "jql":        f"project={project} ORDER BY created DESC",
+            "maxResults": batch_size,
+            "fields":     "summary,description,status,priority,issuetype,"
+                          "assignee,reporter,created,updated,resolutiondate,"
+                          "labels,fixVersions",
+        }
+        if next_page_token:
+            params["nextPageToken"] = next_page_token
+
         resp = requests.get(
-            f"{jira_url}/rest/api/3/search",
-            params={
-                "jql":        f"project={project} ORDER BY created DESC",
-                "startAt":    start_at,
-                "maxResults": batch_size,
-                "fields":     "summary,description,status,priority,issuetype,"
-                              "assignee,reporter,created,updated,resolutiondate,"
-                              "labels,fixVersions",
-            },
+            # Atlassian removed GET /rest/api/3/search entirely (410 Gone,
+            # final shutdown completed Oct 2025) — /search/jql is the
+            # replacement and uses nextPageToken pagination, not startAt.
+            f"{jira_url}/rest/api/3/search/jql",
+            params=params,
             auth=auth, timeout=30,
         )
         resp.raise_for_status()
@@ -464,7 +471,8 @@ def ingest_tickets(conn, project: str | None = None, max_results: int = 5000) ->
                     log.warning("  Skip bug_report %s: %s", key, exc)
 
         start_at += len(issues)
-        if len(issues) < batch_size:
+        next_page_token = data.get("nextPageToken")
+        if data.get("isLast", not next_page_token) or start_at >= max_results:
             break
 
     log.info("  Upserted %d tickets, %d bug reports.", tickets_inserted, bugs_inserted)
