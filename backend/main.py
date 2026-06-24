@@ -392,14 +392,20 @@ def _run_ingest_job() -> None:
     try:
         from ingest.run_ingest import main as ingest_main
 
-        log_handler = logging.StreamHandler(buf)
-        log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        buf_handler = logging.StreamHandler(buf)
+        buf_handler.setFormatter(formatter)
+        console_handler = logging.StreamHandler()  # -> stdout, visible in Render Logs tab
+        console_handler.setFormatter(formatter)
         ingest_logger = logging.getLogger("gitmind.ingest")
-        ingest_logger.addHandler(log_handler)
+        ingest_logger.addHandler(buf_handler)
+        ingest_logger.addHandler(console_handler)
+        ingest_logger.setLevel(logging.INFO)
         try:
             rc = ingest_main()
         finally:
-            ingest_logger.removeHandler(log_handler)
+            ingest_logger.removeHandler(buf_handler)
+            ingest_logger.removeHandler(console_handler)
         _ingest_state["last_result"] = {"exit_code": rc, "log": buf.getvalue()[-8000:]}
     except Exception as exc:  # noqa: BLE001
         log.error("Ingest run failed: %s", exc, exc_info=True)
