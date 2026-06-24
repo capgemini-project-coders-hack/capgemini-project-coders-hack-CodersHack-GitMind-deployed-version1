@@ -211,21 +211,29 @@ def ingest_tickets(driver, project: str | None = None, max_results: int = 5000) 
     start_at   = 0
     batch_size = 100
     inserted   = 0
+    next_page_token = None
 
-    while start_at < max_results:
+    while True:
+        params = {
+            "jql":        f"project={project} ORDER BY created DESC",
+            "maxResults": batch_size,
+            "fields":     "summary,description,status,priority,issuetype,"
+                          "assignee,reporter,created,updated,resolutiondate,labels",
+        }
+        if next_page_token:
+            params["nextPageToken"] = next_page_token
+
         resp = requests.get(
-            f"{jira_url}/rest/api/3/search",
-            params={
-                "jql":        f"project={project} ORDER BY created DESC",
-                "startAt":    start_at,
-                "maxResults": batch_size,
-                "fields":     "summary,description,status,priority,issuetype,"
-                              "assignee,reporter,created,updated,resolutiondate,labels",
-            },
+            # /rest/api/3/search was removed by Atlassian (410 Gone, final
+            # shutdown Oct 2025) — /search/jql is the replacement and
+            # paginates via nextPageToken/isLast instead of startAt.
+            f"{jira_url}/rest/api/3/search/jql",
+            params=params,
             auth=auth, timeout=30,
         )
         resp.raise_for_status()
-        issues = resp.json().get("issues", [])
+        data = resp.json()
+        issues = data.get("issues", [])
         if not issues:
             break
 
@@ -273,7 +281,8 @@ def ingest_tickets(driver, project: str | None = None, max_results: int = 5000) 
                 inserted += 1
 
         start_at += len(issues)
-        if len(issues) < batch_size:
+        next_page_token = data.get("nextPageToken")
+        if data.get("isLast", not next_page_token) or start_at >= max_results:
             break
 
     log.info("  Merged %d Ticket nodes.", inserted)
