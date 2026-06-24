@@ -65,6 +65,12 @@ class GitHubFetchRequest(BaseModel):
     include_file_previews: bool = False
 
 
+class RepoIngestRequest(BaseModel):
+    """Body for POST /ingest/repo — any public GitHub repo, on demand."""
+    repo: str = Field(..., min_length=3, description="owner/repo, or a full GitHub URL")
+    branch: str = Field(default="main")
+
+
 class SnowflakeDetails:
     """Whitelisted detail queries against the Snowflake ledger."""
 
@@ -131,6 +137,22 @@ class SnowflakeDetails:
 
 CAUSAL_WORDS = ("why", "how", "trace", "influence", "influenced", "caused", "root cause")
 FACT_WORDS = ("list", "count", "summarize the text of", "summarise the text of", "show logs", "show")
+
+# owner/repo, optionally as a full GitHub URL — used to validate /ingest/repo
+# input before it ever reaches GitHub/Snowflake/Neo4j calls.
+_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GITHUB_URL_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?(?:$|[/?#])")
+
+
+def normalize_repo_slug(raw: str) -> str:
+    """Accepts 'owner/repo' or any github.com/owner/repo URL, returns 'owner/repo'."""
+    raw = raw.strip()
+    m = _GITHUB_URL_RE.search(raw)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}"
+    if _REPO_SLUG_RE.match(raw):
+        return raw
+    raise ValueError(f"Could not parse a GitHub 'owner/repo' from: {raw!r}")
 
 
 def classify_intent(query: str) -> QueryIntent:
@@ -436,6 +458,103 @@ def ingest_status(x_admin_token: str = Header(None)) -> dict[str, Any]:
     if not expected or x_admin_token != expected:
         raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Token header")
     return {"running": _ingest_state["running"], "last_result": _ingest_state["last_result"]}
+
+
+# ---------------------------------------------------------------------------
+# On-demand ingest for ANY public repo, called by the frontend itself
+# (no admin token — this is a user-facing action, not an admin op).
+#
+# Every call wipes Snowflake + Neo4j first (TRUNCATE / DETACH DELETE — see
+# reset_all() in both ETL modules) before pulling the new repo. This is the
+# "wipe old data" behaviour: since the only thing that previously held
+# state was whatever repo got ingested into these two stores, clearing them
+# right before a new repo's ingest guarantees the graph never mixes data
+# from two different repos, and a stale repo's data never lingers after the
+# frontend is pointed at something new.
+# ---------------------------------------------------------------------------
+
+_repo_ingest_state: dict[str, Any] = {
+    "running": False,
+    "current_repo": None,
+    "last_result": None,
+}
+
+
+def _run_repo_ingest_job(repo: str, branch: str) -> None:
+    import io
+
+    _repo_ingest_state["running"] = True
+    _repo_ingest_state["current_repo"] = repo
+    buf = io.StringIO()
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    buf_handler = logging.StreamHandler(buf)
+    buf_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    loggers = [logging.getLogger("gitmind.ingest"),
+               logging.getLogger("gitmind.etl.snowflake"),
+               logging.getLogger("gitmind.etl.neo4j")]
+    for lg in loggers:
+        lg.addHandler(buf_handler)
+        lg.addHandler(console_handler)
+        lg.setLevel(logging.INFO)
+
+    try:
+        from ingest import snowflake_etl, neo4j_etl
+
+        log.info("Wiping previous repo's data before ingesting %s...", repo)
+        try:
+            snowflake_etl.reset_all()
+        except Exception as exc:
+            log.warning("Snowflake reset failed (continuing): %s", exc)
+        try:
+            neo4j_etl.reset_all()
+        except Exception as exc:
+            log.warning("Neo4j reset failed (continuing): %s", exc)
+
+        # Reuse run_ingest's per-step isolation by pointing it at this repo.
+        _os.environ["GITMIND_INGEST_REPO"] = repo
+        from ingest.run_ingest import main as ingest_main
+        rc = ingest_main()
+
+        _repo_ingest_state["last_result"] = {
+            "repo": repo, "exit_code": rc, "log": buf.getvalue()[-8000:]
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.error("Repo ingest failed for %s: %s", repo, exc, exc_info=True)
+        _repo_ingest_state["last_result"] = {
+            "repo": repo, "exit_code": 1, "log": buf.getvalue()[-8000:] + f"\nFATAL: {exc}"
+        }
+    finally:
+        for lg in loggers:
+            lg.removeHandler(buf_handler)
+            lg.removeHandler(console_handler)
+        _repo_ingest_state["running"] = False
+
+
+@router.post("/ingest/repo")
+def ingest_repo(payload: RepoIngestRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    """Ingest any public GitHub repo on demand. Wipes prior repo's data first."""
+    try:
+        slug = normalize_repo_slug(payload.repo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if _repo_ingest_state["running"]:
+        return {"status": "already_running", "current_repo": _repo_ingest_state["current_repo"]}
+
+    background_tasks.add_task(_run_repo_ingest_job, slug, payload.branch)
+    return {"status": "started", "repo": slug}
+
+
+@router.get("/ingest/repo/status")
+def ingest_repo_status() -> dict[str, Any]:
+    return {
+        "running": _repo_ingest_state["running"],
+        "current_repo": _repo_ingest_state["current_repo"],
+        "last_result": _repo_ingest_state["last_result"],
+    }
 
 
 @router.post("/query", response_model=GitMindQueryResponse)
