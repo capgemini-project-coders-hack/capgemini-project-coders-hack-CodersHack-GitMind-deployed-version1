@@ -377,6 +377,61 @@ def add_to_waitlist(payload: WaitlistEntry) -> WaitlistResponse:
     )
 
 
+_ingest_state: dict[str, Any] = {"running": False, "last_result": None}
+
+
+def _run_ingest_job() -> None:
+    """Runs in a BackgroundTask on the free web service — no paid Shell or
+    One-Off Jobs needed. Same env vars this service already has.
+    """
+    import io
+    import contextlib
+
+    _ingest_state["running"] = True
+    buf = io.StringIO()
+    try:
+        from ingest.run_ingest import main as ingest_main
+
+        log_handler = logging.StreamHandler(buf)
+        log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        ingest_logger = logging.getLogger("gitmind.ingest")
+        ingest_logger.addHandler(log_handler)
+        try:
+            rc = ingest_main()
+        finally:
+            ingest_logger.removeHandler(log_handler)
+        _ingest_state["last_result"] = {"exit_code": rc, "log": buf.getvalue()[-8000:]}
+    except Exception as exc:  # noqa: BLE001
+        log.error("Ingest run failed: %s", exc, exc_info=True)
+        _ingest_state["last_result"] = {"exit_code": 1, "log": buf.getvalue()[-8000:] + f"\nFATAL: {exc}"}
+    finally:
+        _ingest_state["running"] = False
+
+
+@router.post("/admin/ingest")
+def trigger_ingest(background_tasks: BackgroundTasks, x_admin_token: str = Header(None)) -> dict[str, Any]:
+    """Trigger ingest/run_ingest.py over plain HTTP — workaround for not
+    having paid Render Shell/Jobs access. Protect with ADMIN_TOKEN env var.
+    """
+    expected = _os.environ.get("ADMIN_TOKEN")
+    if not expected:
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN not configured on this service")
+    if x_admin_token != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Token header")
+    if _ingest_state["running"]:
+        return {"status": "already_running"}
+    background_tasks.add_task(_run_ingest_job)
+    return {"status": "started"}
+
+
+@router.get("/admin/ingest/status")
+def ingest_status(x_admin_token: str = Header(None)) -> dict[str, Any]:
+    expected = _os.environ.get("ADMIN_TOKEN")
+    if not expected or x_admin_token != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Token header")
+    return {"running": _ingest_state["running"], "last_result": _ingest_state["last_result"]}
+
+
 @router.post("/query", response_model=GitMindQueryResponse)
 def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryResponse:
     graph: Neo4jCausalGraph | None = getattr(request.app.state, "neo4j_graph", None)
