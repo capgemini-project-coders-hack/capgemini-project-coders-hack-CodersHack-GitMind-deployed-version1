@@ -12,6 +12,7 @@ python -m ingest.snowflake_etl --step commits --repo owner/repo
 python -m ingest.snowflake_etl --step tickets
 python -m ingest.snowflake_etl --step messages --channel C0XXXXXX
 python -m ingest.snowflake_etl --step adrs --repo owner/repo
+python -m ingest.snowflake_etl --step reset           # wipe all 6 tables
 
 ENVIRONMENT VARIABLES
 ---------------------
@@ -164,6 +165,9 @@ CREATE TABLE IF NOT EXISTS DECISIONS (
 );
 """
 
+# All tables this pipeline owns — used by both DDL and reset_all().
+ALL_TABLES = ["COMMITS", "TICKETS", "MESSAGES", "ADR_RECORDS", "BUG_REPORTS", "DECISIONS"]
+
 
 def run_ddl(conn) -> None:
     log.info("Creating tables (IF NOT EXISTS)...")
@@ -180,10 +184,33 @@ def run_ddl(conn) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 0: Reset — wipe all rows from all 6 tables (called on frontend refresh
+# / repo switch so stale data from a previous repo never bleeds into a new
+# query). TRUNCATE keeps the table+schema intact, just empties rows; cheap
+# and instant in Snowflake regardless of row count.
+# ---------------------------------------------------------------------------
+
+def reset_all(conn=None) -> None:
+    own_conn = conn is None
+    conn = conn or _get_conn()
+    cur = conn.cursor()
+    try:
+        for table in ALL_TABLES:
+            cur.execute(f"TRUNCATE TABLE IF EXISTS {table}")
+            log.info("  Truncated %s", table)
+        log.info("Snowflake reset complete — all %d tables emptied.", len(ALL_TABLES))
+    finally:
+        cur.close()
+        if own_conn:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Step 2: Commits
 # ---------------------------------------------------------------------------
 
 def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None:
+    # max_pages=10 * per_page=100 = 1000 commits cap (rolled back from 50/5000).
     import requests
 
     token = os.getenv("GITHUB_TOKEN")
@@ -192,7 +219,8 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
         headers["Authorization"] = f"Bearer {token}"
 
     owner, repo_name = repo.split("/", 1)
-    log.info("Fetching commits from %s @ %s (max %d pages)...", repo, branch, max_pages)
+    log.info("Fetching commits from %s @ %s (max %d pages / %d commits)...",
+              repo, branch, max_pages, max_pages * 100)
 
     all_commits: list[dict] = []
     for page in range(1, max_pages + 1):
@@ -597,15 +625,26 @@ def _extract_section(text: str, pattern: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GitMind Snowflake ETL")
     parser.add_argument("--step", default="all",
-                        choices=["all", "ddl", "commits", "tickets", "messages", "adrs"])
+                        choices=["all", "ddl", "commits", "tickets", "messages", "adrs", "reset"])
     parser.add_argument("--repo", help="owner/repo for commits and ADRs")
     parser.add_argument("--branch", default="main")
     parser.add_argument("--channel", help="Slack channel ID")
     parser.add_argument("--adr-path", default="docs/adr")
     parser.add_argument("--project", help="Jira project key")
+    parser.add_argument("--max-pages", type=int, default=10,
+                        help="GitHub commit pages to fetch (10 pages * 100/page = 1000 commits)")
     args = parser.parse_args(argv)
 
     step = args.step
+
+    if step == "reset":
+        try:
+            reset_all()
+        except Exception as exc:
+            log.error("reset step failed: %s", exc)
+            return 1
+        log.info("ETL done.")
+        return 0
 
     if step in ("all", "ddl"):
         try:
@@ -623,7 +662,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         else:
             try:
-                ingest_commits(repo, branch=args.branch)
+                ingest_commits(repo, branch=args.branch, max_pages=args.max_pages)
             except Exception as exc:
                 log.error("commits step failed: %s", exc)
 
