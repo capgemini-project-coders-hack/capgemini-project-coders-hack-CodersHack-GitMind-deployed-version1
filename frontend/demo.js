@@ -358,7 +358,11 @@ def analyze_repository(repo_url):
         ? (state.dm_github.branches || []).length
         : 0;
       const causalChain = (state.dm_result && state.dm_result.causal_chain) || [];
-      const issues = causalChain.length || (state.dm_github ? 0 : 2);
+      // "Issues" must mean actual Ticket/Jira/BugReport nodes, NOT raw
+      // commits. causalChain.length was wrongly using the full commit
+      // count (every Commit node) as the "Issues" stat.
+      const ISSUE_LABELS = new Set(["Ticket", "JiraTicket", "BugReport"]);
+      const issues = causalChain.filter((n) => ISSUE_LABELS.has(n.label)).length;
       const regressions = (state.dm_result && state.dm_result.regression_check && state.dm_result.regression_check.regressions_found) ? state.dm_result.regression_check.regressions_found.length : 0;
       statsBox.innerHTML = `
         <div class="dm-stats-grid">
