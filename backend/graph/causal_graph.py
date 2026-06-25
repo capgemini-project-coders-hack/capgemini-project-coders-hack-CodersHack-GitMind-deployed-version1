@@ -72,7 +72,7 @@ class Neo4jCausalGraph:
 
         cypher = f"""
         MATCH (start {match_clause})
-        OPTIONAL MATCH path = (start)-[:CAUSED_BY|INFLUENCED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY*1..{max_depth}]->(node)
+        OPTIONAL MATCH path = (start)-[:CAUSED_BY|INFLUENCED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY*1..{max_depth}]-(node)
         WITH start, node, length(path) AS depth
         ORDER BY depth
         WITH start, COLLECT(DISTINCT node) AS chain_nodes
