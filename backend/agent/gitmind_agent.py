@@ -322,7 +322,6 @@ def debug(
     entity_id: str = "",
     function_name: str = "",
     ticket_id: str = "",
-    max_depth: int = 10,
 ) -> dict[str, Any]:
     """Run the causal-debugging agent for a natural-language query.
 
@@ -364,7 +363,6 @@ def debug(
                 entity_id=entity_id,
                 function_name=function_name,
                 ticket_id=ticket_id,
-                max_depth=max_depth,
             )
         except Exception as exc:  # noqa: BLE001 - fall through to LLM-only answer
             log.warning("Neo4j trace failed inside agent: %s", exc)
