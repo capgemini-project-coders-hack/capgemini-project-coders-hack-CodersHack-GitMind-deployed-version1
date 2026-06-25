@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
@@ -276,7 +277,49 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
             if len(batch) < 100:
                 break
 
-    log.info("  %d unique commits fetched across all branches; enriching with diff stats...", len(commits_by_sha))
+    log.info("  %d unique commits fetched across all branches; enriching with diff stats (parallel)...", len(commits_by_sha))
+
+    def _fetch_diff_stats(sha: str) -> tuple[str, dict]:
+        # GitHub's secondary/abuse rate limit isn't tied to a fixed request
+        # count -- it trips on burst concurrency + rate over a rolling
+        # window, so there's no "after N commits" number to hardcode.
+        # Instead: detect it (403 + Retry-After, or the abuse-detection
+        # message) and back off + retry, which adapts correctly regardless
+        # of repo size instead of guessing a "safe" worker count up front.
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = requests.get(
+                    f"https://api.github.com/repos/{owner}/{repo_name}/commits/{sha}",
+                    headers=headers, timeout=15,
+                )
+                if resp.status_code == 403:
+                    retry_after = resp.headers.get("Retry-After")
+                    wait = float(retry_after) if retry_after else min(2 ** attempt, 30)
+                    log.warning("    Rate-limited fetching %s (attempt %d/%d) -- waiting %.1fs",
+                                sha[:7], attempt, max_attempts, wait)
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return sha, resp.json()
+            except Exception:
+                if attempt == max_attempts:
+                    return sha, {}
+                time.sleep(min(2 ** attempt, 30))
+        return sha, {}
+
+    # These per-commit GET requests are independent of each other -- doing
+    # them sequentially was the single biggest cost in the whole ingest
+    # pipeline (N commits = N back-to-back network round-trips). A small
+    # bounded thread pool collapses that to roughly one round-trip's worth
+    # of wall-clock time, while the retry/backoff above absorbs any
+    # secondary rate-limit hits instead of needing a fixed worker count.
+    diff_stats_by_sha: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_fetch_diff_stats, sha) for sha in commits_by_sha]
+        for future in as_completed(futures):
+            sha, detail = future.result()
+            diff_stats_by_sha[sha] = detail
 
     rows: list[tuple] = []
     for sha, entry in commits_by_sha.items():
@@ -286,25 +329,16 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
         author_data = commit_data.get("author") or {}
         message     = commit_data.get("message", "")
 
-        # Fetch diff stats per commit
-        additions = deletions = files_changed = 0
-        patch_summary = ""
-        try:
-            detail = requests.get(
-                f"https://api.github.com/repos/{owner}/{repo_name}/commits/{sha}",
-                headers=headers, timeout=15,
-            ).json()
-            stats = detail.get("stats", {})
-            additions = stats.get("additions", 0)
-            deletions = stats.get("deletions", 0)
-            files = detail.get("files", [])
-            files_changed = len(files)
-            patch_summary = "; ".join(
-                f"{f.get('filename','?')} +{f.get('additions',0)}/-{f.get('deletions',0)}"
-                for f in files[:10]
-            )[:8000]
-        except Exception:
-            pass
+        detail = diff_stats_by_sha.get(sha, {})
+        stats = detail.get("stats", {})
+        additions = stats.get("additions", 0)
+        deletions = stats.get("deletions", 0)
+        files = detail.get("files", [])
+        files_changed = len(files)
+        patch_summary = "; ".join(
+            f"{f.get('filename','?')} +{f.get('additions',0)}/-{f.get('deletions',0)}"
+            for f in files[:10]
+        )[:8000]
 
         rows.append((
             sha,
@@ -365,18 +399,10 @@ def ingest_tickets(project: str | None = None, max_results: int = 5000) -> None:
     import requests
     from requests.auth import HTTPBasicAuth
 
-    jira_url = os.getenv("JIRA_URL", "").rstrip("/")
-    jira_user = os.getenv("JIRA_USER", "")
-    jira_token = os.getenv("JIRA_API_TOKEN", "")
-    project = project or os.getenv("JIRA_DEFAULT_PROJECT", "")
-
-    if not jira_url or not jira_user or not jira_token:
-        log.warning("Jira env vars (JIRA_URL, JIRA_USER, JIRA_API_TOKEN) not set — skipping ticket ingestion.")
-        return
-    if not project:
-        log.warning("JIRA_DEFAULT_PROJECT not set — skipping ticket ingestion.")
-        return
-
+    jira_url = _require("JIRA_URL").rstrip("/")
+    jira_user = _require("JIRA_USER")
+    jira_token = _require("JIRA_API_TOKEN")
+    project = project or os.getenv("JIRA_DEFAULT_PROJECT", "PLAT")
     auth = HTTPBasicAuth(jira_user, jira_token)
 
     log.info("Fetching Jira tickets for project %s...", project)
