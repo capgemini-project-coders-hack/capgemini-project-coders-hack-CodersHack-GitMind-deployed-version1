@@ -238,7 +238,19 @@ def analyze_repository(repo_url):
       // Re-ingest graph for THIS repo first -- fixes stale-graph bug where
       // /query kept answering from whatever repo was ingested previously.
       renderLoading();
-      await ingestRepoAndWait(state.dm_repo, 90000);
+      const ingestOk = await ingestRepoAndWait(state.dm_repo, 180000);
+      if (!ingestOk) {
+        // Do NOT fall through to /query against a half-written graph --
+        // that produced silently wrong/partial node counts (e.g. 12 of 35
+        // commits) with no visible error. Surface it instead.
+        state.dm_error = "Repo ingest did not finish in time (or failed) -- " +
+          "the causal graph may be incomplete or stale. Try Analyze again " +
+          "in a moment, or check backend logs for the ingest run.";
+        state.dm_loaded = true;
+        state.dm_loading = false;
+        renderAll();
+        return;
+      }
 
       // POST /query
       try {
