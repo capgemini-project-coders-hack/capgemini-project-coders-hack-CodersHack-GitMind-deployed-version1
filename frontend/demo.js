@@ -181,6 +181,36 @@ def analyze_repository(repo_url):
     }
   }
 
+  // ── Ingest helper ────────────────────────────────────────────────────────
+  // The causal graph (Neo4j/Snowflake) is NOT scoped by a repo param on
+  // /query -- it just queries whatever data was ingested last. Without this
+  // step, every analysis would silently trace whichever repo happened to be
+  // ingested previously (stale graph), no matter what URL the user typed.
+  // POST /ingest/repo wipes the prior repo's data and re-ingests this one;
+  // we poll /ingest/repo/status until it finishes before calling /query.
+  async function ingestRepoAndWait(repoUrl, maxWaitMs) {
+    try {
+      const startResp = await postJSON("/ingest/repo", { repo: repoUrl }, 30000);
+      if (startResp.status !== 200) return false;
+
+      const deadline = Date.now() + (maxWaitMs || 90000);
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const statusResp = await fetch(`${BACKEND_URL}/ingest/repo/status`, {
+          signal: AbortSignal.timeout(15000),
+        });
+        if (statusResp.status !== 200) continue;
+        const statusData = await statusResp.json();
+        if (!statusData.running) {
+          return !statusData.last_result || statusData.last_result.exit_code === 0;
+        }
+      }
+      return false; // timed out -- fall through, /query will run against whatever exists
+    } catch (_) {
+      return false;
+    }
+  }
+
   // ── Main analyze flow (mirrors `if analyze:` block) ────────────────────
   async function runAnalysis(rawUrl) {
     state.dm_loading = true;
@@ -205,6 +235,11 @@ def analyze_repository(repo_url):
       state.dm_loaded = true;
       state.dm_loading = false;
     } else {
+      // Re-ingest graph for THIS repo first -- fixes stale-graph bug where
+      // /query kept answering from whatever repo was ingested previously.
+      renderLoading();
+      await ingestRepoAndWait(state.dm_repo, 90000);
+
       // POST /query
       try {
         const resp = await postJSON("/query", { query: queryText }, 70000);
@@ -292,7 +327,7 @@ def analyze_repository(repo_url):
     tracesBody.innerHTML = `
       <div class="dm-loading">
         <div class="dm-spinner"></div>
-        <div class="dm-loading-text">Building causal dependency graph…</div>
+        <div class="dm-loading-text">Ingesting repo &amp; building causal dependency graph…</div>
       </div>`;
   }
 
