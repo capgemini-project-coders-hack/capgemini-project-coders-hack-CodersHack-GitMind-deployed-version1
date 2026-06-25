@@ -171,8 +171,34 @@ def _merge_rel(session, from_id: str, from_label: str,
 # Step 2: Commits
 # ---------------------------------------------------------------------------
 
+def _list_branches(owner: str, repo_name: str, headers: dict) -> list[str]:
+    import requests
+
+    branches: list[str] = []
+    page = 1
+    while True:
+        resp = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo_name}/branches",
+            params={"per_page": 100, "page": page},
+            headers=headers, timeout=30,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        branches.extend(b["name"] for b in batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return branches
+
+
 def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10) -> None:
-    # max_pages=10 * per_page=100 = 1000 commits cap (rolled back from 50/5000).
+    # max_pages=10 * per_page=100 = 1000 commits cap PER BRANCH (rolled back
+    # from 50/5000). `branch` arg is kept only for CLI backward-compat and is
+    # ignored below -- commits are now ingested for EVERY branch so the
+    # causal graph isn't limited to main, and so commit-to-commit edges
+    # (added below) can connect history across all branches, not just one.
     import requests
 
     token   = os.getenv("GITHUB_TOKEN")
@@ -181,28 +207,42 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
         headers["Authorization"] = f"Bearer {token}"
 
     owner, repo_name = repo.split("/", 1)
-    log.info("Fetching commits from %s @ %s (max %d pages / %d commits)...",
-              repo, branch, max_pages, max_pages * 100)
 
-    all_commits: list[dict] = []
-    for page in range(1, max_pages + 1):
-        resp = requests.get(
-            f"https://api.github.com/repos/{owner}/{repo_name}/commits",
-            params={"sha": branch, "per_page": 100, "page": page},
-            headers=headers, timeout=30,
-        )
-        resp.raise_for_status()
-        batch = resp.json()
-        if not batch:
-            break
-        all_commits.extend(batch)
-        if len(batch) < 100:
-            break
+    branches = _list_branches(owner, repo_name, headers)
+    if not branches:
+        branches = [branch]  # fallback if /branches call returns nothing
 
-    log.info("  Merging %d Commit nodes...", len(all_commits))
+    log.info("Fetching commits from %s across %d branch(es) (max %d pages / %d commits per branch)...",
+              repo, len(branches), max_pages, max_pages * 100)
+
+    # sha -> (commit_dict, branch_name_first_seen, parents) -- dedupe commits
+    # that appear on multiple branches; MERGE on sha already makes the Neo4j
+    # side idempotent, but collecting parents once avoids redundant edge
+    # MERGE calls for every branch a commit happens to be reachable from.
+    commits_by_sha: dict[str, dict] = {}
+
+    for b_name in branches:
+        for page in range(1, max_pages + 1):
+            resp = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo_name}/commits",
+                params={"sha": b_name, "per_page": 100, "page": page},
+                headers=headers, timeout=30,
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+            if not batch:
+                break
+            for c in batch:
+                sha = c["sha"]
+                if sha not in commits_by_sha:
+                    commits_by_sha[sha] = {"commit": c, "branch": b_name}
+            if len(batch) < 100:
+                break
+
+    log.info("  Merging %d Commit nodes...", len(commits_by_sha))
     with driver.session(database=_db(driver)) as session:
-        for c in all_commits:
-            sha         = c["sha"]
+        for sha, entry in commits_by_sha.items():
+            c           = entry["commit"]
             commit_data = c.get("commit", {})
             author_data = commit_data.get("author") or {}
             message     = commit_data.get("message", "")
@@ -210,7 +250,7 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
 
             _merge_node(session, "Commit", sha, {
                 "repo":      repo,
-                "branch":    branch,
+                "branch":    entry["branch"],
                 "author":    (c.get("author") or {}).get("login") or author_data.get("name", ""),
                 "message":   message[:2000],
                 "summary":   message.split("\n")[0][:500],
@@ -218,7 +258,22 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
                 "url":       c.get("html_url", ""),
             })
 
-    log.info("  Done — %d Commit nodes merged.", len(all_commits))
+        log.info("  Done — %d Commit nodes merged.", len(commits_by_sha))
+
+        # Commit-to-commit causal edges: every parent SHA, including all
+        # parents of merge commits and across every branch. Lets trace()
+        # walk real commit history even when no Jira/Slack/ADR/bug data
+        # exists to link things together.
+        edge_count = 0
+        for sha, entry in commits_by_sha.items():
+            for parent in entry["commit"].get("parents", []):
+                parent_sha = parent.get("sha")
+                if not parent_sha or parent_sha not in commits_by_sha:
+                    continue
+                _merge_rel(session, sha, "Commit", "CAUSED_BY", parent_sha, "Commit")
+                edge_count += 1
+
+        log.info("  Done — %d Commit -[CAUSED_BY]-> Commit edges merged.", edge_count)
 
 
 # ---------------------------------------------------------------------------
