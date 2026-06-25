@@ -56,15 +56,16 @@ class Neo4jCausalGraph:
         entity_id: str = "",
         function_name: str = "",
         ticket_id: str = "",
-        max_depth: int = 10,
+        max_depth: int = 500,
     ) -> list[GraphPathNode]:
         """Traverse the causal graph from the given starting identifier.
 
-        TODO: replace this placeholder Cypher with the real query for
-        your schema. As written, this looks for *any* node matching the
-        supplied id/property and walks outward along a generic set of
-        causal relationship types, which is enough to keep `/query`
-        functional but is not tuned to your actual graph model.
+        Walks outward (both directions -- ancestors AND descendants, so
+        sibling branches that diverged from a shared commit are reachable
+        too) along a generic set of causal relationship types. `max_depth`
+        is set high enough to cover an entire repo's commit DAG in one
+        pass (graph diameter is normally far smaller than commit count, so
+        this stays cheap) instead of silently truncating large histories.
         """
         match_clause, params = self._build_match(entity_id, function_name, ticket_id)
         if match_clause is None:
@@ -73,8 +74,6 @@ class Neo4jCausalGraph:
         cypher = f"""
         MATCH (start {match_clause})
         OPTIONAL MATCH path = (start)-[:CAUSED_BY|INFLUENCED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY*1..{max_depth}]-(node)
-        WITH start, node, length(path) AS depth
-        ORDER BY depth
         WITH start, COLLECT(DISTINCT node) AS chain_nodes
         RETURN start, chain_nodes
         """
@@ -86,13 +85,30 @@ class Neo4jCausalGraph:
                 return []
 
             nodes = [record["start"]] + [n for n in record["chain_nodes"] if n is not None]
+
+            # Order by actual commit/event time (topological-ish, branch
+            # point first, then both branches interleaved chronologically)
+            # rather than BFS hop-distance, which scrambled commit order
+            # and hid how branches relate to each other in time.
+            def _sort_key(n):
+                props = dict(n)
+                ts = props.get("timestamp") or props.get("created_at") or props.get("date") or ""
+                return (ts == "", ts)  # empty timestamps sort last, then lexicographic ISO-8601
+
+            nodes.sort(key=_sort_key)
+
+            seen_ids: set[str] = set()
             chain: list[GraphPathNode] = []
             for n in nodes:
                 props = dict(n)
                 labels = list(n.labels) if hasattr(n, "labels") else []
+                node_id = props.get("id") or props.get("node_id") or str(n.element_id if hasattr(n, "element_id") else "")
+                if node_id in seen_ids:
+                    continue  # a commit reachable via multiple branches should appear once
+                seen_ids.add(node_id)
                 chain.append(
                     GraphPathNode(
-                        node_id=props.get("id") or props.get("node_id") or str(n.element_id if hasattr(n, "element_id") else ""),
+                        node_id=node_id,
                         label=labels[0] if labels else props.get("label", "Unknown"),
                         summary=props.get("summary") or props.get("text") or props.get("title", ""),
                         source_type=props.get("source_type", labels[0] if labels else ""),
