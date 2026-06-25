@@ -209,8 +209,36 @@ def reset_all(conn=None) -> None:
 # Step 2: Commits
 # ---------------------------------------------------------------------------
 
+def _list_branches(owner: str, repo_name: str, headers: dict) -> list[str]:
+    import requests
+
+    branches: list[str] = []
+    page = 1
+    while True:
+        resp = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo_name}/branches",
+            params={"per_page": 100, "page": page},
+            headers=headers, timeout=30,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        branches.extend(b["name"] for b in batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return branches
+
+
 def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None:
-    # max_pages=10 * per_page=100 = 1000 commits cap (rolled back from 50/5000).
+    # max_pages=10 * per_page=100 = 1000 commits cap PER BRANCH.
+    # `branch` is kept only for CLI back-compat and ignored below: commits
+    # are now pulled for EVERY branch (deduped by sha), matching
+    # ingest/neo4j_etl.py's behavior. Before this fix, Snowflake (Traces
+    # panel) only ever saw `main`'s commits while Neo4j (Graph panel) saw
+    # all branches -- two different commit sets that looked like "random
+    # mismatched nodes" because they genuinely were different data.
     import requests
 
     token = os.getenv("GITHUB_TOKEN")
@@ -219,32 +247,44 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
         headers["Authorization"] = f"Bearer {token}"
 
     owner, repo_name = repo.split("/", 1)
-    log.info("Fetching commits from %s @ %s (max %d pages / %d commits)...",
-              repo, branch, max_pages, max_pages * 100)
 
-    all_commits: list[dict] = []
-    for page in range(1, max_pages + 1):
-        resp = requests.get(
-            f"https://api.github.com/repos/{owner}/{repo_name}/commits",
-            params={"sha": branch, "per_page": 100, "page": page},
-            headers=headers, timeout=30,
-        )
-        resp.raise_for_status()
-        batch = resp.json()
-        if not batch:
-            break
-        all_commits.extend(batch)
-        if len(batch) < 100:
-            break
+    branches = _list_branches(owner, repo_name, headers)
+    if not branches:
+        branches = [branch]  # fallback if /branches call returns nothing
 
-    log.info("  %d commits fetched; enriching with diff stats...", len(all_commits))
+    log.info("Fetching commits from %s across %d branch(es) (max %d pages / %d commits per branch)...",
+              repo, len(branches), max_pages, max_pages * 100)
+
+    # sha -> (commit_dict, branch_name_first_seen) -- dedupe commits that
+    # appear on multiple branches so each lands in Snowflake exactly once.
+    commits_by_sha: dict[str, dict] = {}
+    for b_name in branches:
+        for page in range(1, max_pages + 1):
+            resp = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo_name}/commits",
+                params={"sha": b_name, "per_page": 100, "page": page},
+                headers=headers, timeout=30,
+            )
+            resp.raise_for_status()
+            batch = resp.json()
+            if not batch:
+                break
+            for c in batch:
+                sha = c["sha"]
+                if sha not in commits_by_sha:
+                    commits_by_sha[sha] = {"commit": c, "branch": b_name}
+            if len(batch) < 100:
+                break
+
+    log.info("  %d unique commits fetched across all branches; enriching with diff stats...", len(commits_by_sha))
 
     rows: list[tuple] = []
-    for c in all_commits:
-        sha = c["sha"]
+    for sha, entry in commits_by_sha.items():
+        c           = entry["commit"]
+        commit_branch = entry["branch"]
         commit_data = c.get("commit", {})
         author_data = commit_data.get("author") or {}
-        message = commit_data.get("message", "")
+        message     = commit_data.get("message", "")
 
         # Fetch diff stats per commit
         additions = deletions = files_changed = 0
@@ -269,7 +309,7 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
         rows.append((
             sha,
             repo,
-            branch,
+            commit_branch,
             (c.get("author") or {}).get("login") or author_data.get("name", ""),
             author_data.get("email", ""),
             message[:8000],
