@@ -56,16 +56,14 @@ class Neo4jCausalGraph:
         entity_id: str = "",
         function_name: str = "",
         ticket_id: str = "",
-        max_depth: int = 500,
     ) -> list[GraphPathNode]:
         """Traverse the causal graph from the given starting identifier.
 
         Walks outward (both directions -- ancestors AND descendants, so
         sibling branches that diverged from a shared commit are reachable
-        too) along a generic set of causal relationship types. `max_depth`
-        is set high enough to cover an entire repo's commit DAG in one
-        pass (graph diameter is normally far smaller than commit count, so
-        this stays cheap) instead of silently truncating large histories.
+        too) along a generic set of causal relationship types, with NO
+        depth cap -- the entire connected component (full commit DAG, every
+        branch) is returned in one pass.
         """
         match_clause, params = self._build_match(entity_id, function_name, ticket_id)
         if match_clause is None:
@@ -73,7 +71,7 @@ class Neo4jCausalGraph:
 
         cypher = f"""
         MATCH (start {match_clause})
-        OPTIONAL MATCH path = (start)-[:CAUSED_BY|INFLUENCED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY*1..{max_depth}]-(node)
+        OPTIONAL MATCH path = (start)-[:CAUSED_BY|INFLUENCED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY*]-(node)
         WITH start, COLLECT(DISTINCT node) AS chain_nodes
         RETURN start, chain_nodes
         """
