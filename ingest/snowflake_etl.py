@@ -365,10 +365,18 @@ def ingest_tickets(project: str | None = None, max_results: int = 5000) -> None:
     import requests
     from requests.auth import HTTPBasicAuth
 
-    jira_url = _require("JIRA_URL").rstrip("/")
-    jira_user = _require("JIRA_USER")
-    jira_token = _require("JIRA_API_TOKEN")
-    project = project or os.getenv("JIRA_DEFAULT_PROJECT", "PLAT")
+    jira_url = os.getenv("JIRA_URL", "").rstrip("/")
+    jira_user = os.getenv("JIRA_USER", "")
+    jira_token = os.getenv("JIRA_API_TOKEN", "")
+    project = project or os.getenv("JIRA_DEFAULT_PROJECT", "")
+
+    if not jira_url or not jira_user or not jira_token:
+        log.warning("Jira env vars (JIRA_URL, JIRA_USER, JIRA_API_TOKEN) not set — skipping ticket ingestion.")
+        return
+    if not project:
+        log.warning("JIRA_DEFAULT_PROJECT not set — skipping ticket ingestion.")
+        return
+
     auth = HTTPBasicAuth(jira_user, jira_token)
 
     log.info("Fetching Jira tickets for project %s...", project)
