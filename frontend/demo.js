@@ -195,7 +195,7 @@ def analyze_repository(repo_url):
 
       const deadline = Date.now() + (maxWaitMs || 90000);
       while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2000));
+        await new Promise((r) => setTimeout(r, 5000));
         const statusResp = await fetch(`${BACKEND_URL}/ingest/repo/status`, {
           signal: AbortSignal.timeout(15000),
         });
@@ -238,7 +238,7 @@ def analyze_repository(repo_url):
       // Re-ingest graph for THIS repo first -- fixes stale-graph bug where
       // /query kept answering from whatever repo was ingested previously.
       renderLoading();
-      const ingestOk = await ingestRepoAndWait(state.dm_repo, 180000);
+      const ingestOk = await ingestRepoAndWait(state.dm_repo, 600000);
       if (!ingestOk) {
         // Do NOT fall through to /query against a half-written graph --
         // that produced silently wrong/partial node counts (e.g. 12 of 35
@@ -470,112 +470,14 @@ def analyze_repository(repo_url):
     });
 
     return `
-      <div class="dm-graph-viewport" id="dm-graph-viewport">
-        <div style="font-size:11px;color:#94A3B8;padding:10px 14px 0;text-transform:uppercase;letter-spacing:.05em;position:absolute;top:0;left:0;z-index:2;">Graph View</div>
-        <div class="dm-graph-controls">
-          <button type="button" class="dm-graph-btn" data-graph-action="zoom-in" title="Zoom in">+</button>
-          <button type="button" class="dm-graph-btn" data-graph-action="zoom-out" title="Zoom out">−</button>
-          <button type="button" class="dm-graph-btn" data-graph-action="reset" title="Reset view">⤢</button>
-        </div>
-        <svg id="dm-graph-svg" viewBox="0 0 ${width} ${height}" width="100%" height="100%" style="display:block;cursor:grab;">
-          <g id="dm-graph-pan-zoom">
-            ${defs}
-            ${edgesSvg}
-            ${nodesSvg}
-          </g>
+      <div style="margin-top:14px;background:#fff;border:1px solid #E2E8F0;border-radius:8px;overflow-x:auto;">
+        <div style="font-size:11px;color:#94A3B8;padding:10px 14px 0;text-transform:uppercase;letter-spacing:.05em;">Graph View</div>
+        <svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="display:block;min-width:${width}px;">
+          ${defs}
+          ${edgesSvg}
+          ${nodesSvg}
         </svg>
       </div>`;
-  }
-
-  // ── Pan & zoom controller for the graph viewport ───────────────────────
-  // Locks the SVG inside a fixed-size container (CSS handles the lock --
-  // see .dm-graph-viewport) and drives a transform on the inner <g> so
-  // zoom/pan never changes the SVG's own width/height attrs, which is what
-  // was inflating the grid column and squeezing the RHS timeline before.
-  function initGraphPanZoom() {
-    const viewport = document.getElementById("dm-graph-viewport");
-    const svg = document.getElementById("dm-graph-svg");
-    const g = document.getElementById("dm-graph-pan-zoom");
-    if (!viewport || !svg || !g) return;
-
-    const vb = svg.viewBox.baseVal;
-    const contentWidth = vb.width, contentHeight = vb.height;
-
-    const MIN_SCALE = 0.3, MAX_SCALE = 4;
-    let scale = 1, tx = 0, ty = 0;
-
-    // Fit content to the viewport on first render if it's wider/taller
-    // than the visible box, instead of starting zoomed past the edges.
-    const vpRect = viewport.getBoundingClientRect();
-    const fitScale = Math.min(vpRect.width / contentWidth, vpRect.height / contentHeight, 1);
-    scale = fitScale > 0 ? fitScale : 1;
-    tx = (vpRect.width - contentWidth * scale) / 2;
-    ty = (vpRect.height - contentHeight * scale) / 2;
-
-    function applyTransform() {
-      g.setAttribute("transform", `translate(${tx.toFixed(2)},${ty.toFixed(2)}) scale(${scale.toFixed(3)})`);
-    }
-    applyTransform();
-
-    function zoomBy(factor, originX, originY) {
-      const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale * factor));
-      // Keep the point under the cursor/center stationary while zooming.
-      tx = originX - ((originX - tx) / scale) * newScale;
-      ty = originY - ((originY - ty) / scale) * newScale;
-      scale = newScale;
-      applyTransform();
-    }
-
-    // Wheel = zoom (covers both mouse wheel and trackpad pinch, which
-    // browsers report as wheel events with ctrlKey set).
-    viewport.addEventListener("wheel", (e) => {
-      e.preventDefault();
-      const rect = viewport.getBoundingClientRect();
-      const originX = e.clientX - rect.left;
-      const originY = e.clientY - rect.top;
-      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-      zoomBy(factor, originX, originY);
-    }, { passive: false });
-
-    // Drag to pan (mouse + touch).
-    let dragging = false, lastX = 0, lastY = 0;
-    function dragStart(x, y) { dragging = true; lastX = x; lastY = y; svg.style.cursor = "grabbing"; }
-    function dragMove(x, y) {
-      if (!dragging) return;
-      tx += x - lastX;
-      ty += y - lastY;
-      lastX = x; lastY = y;
-      applyTransform();
-    }
-    function dragEnd() { dragging = false; svg.style.cursor = "grab"; }
-
-    viewport.addEventListener("mousedown", (e) => dragStart(e.clientX, e.clientY));
-    window.addEventListener("mousemove", (e) => dragMove(e.clientX, e.clientY));
-    window.addEventListener("mouseup", dragEnd);
-
-    viewport.addEventListener("touchstart", (e) => {
-      if (e.touches.length === 1) dragStart(e.touches[0].clientX, e.touches[0].clientY);
-    }, { passive: true });
-    viewport.addEventListener("touchmove", (e) => {
-      if (e.touches.length === 1) { dragMove(e.touches[0].clientX, e.touches[0].clientY); e.preventDefault(); }
-    }, { passive: false });
-    viewport.addEventListener("touchend", dragEnd);
-
-    // UI buttons.
-    viewport.querySelectorAll("[data-graph-action]").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        const action = btn.getAttribute("data-graph-action");
-        const cx = vpRect.width / 2, cy = vpRect.height / 2;
-        if (action === "zoom-in") zoomBy(1.25, cx, cy);
-        else if (action === "zoom-out") zoomBy(1 / 1.25, cx, cy);
-        else if (action === "reset") {
-          scale = fitScale > 0 ? fitScale : 1;
-          tx = (vpRect.width - contentWidth * scale) / 2;
-          ty = (vpRect.height - contentHeight * scale) / 2;
-          applyTransform();
-        }
-      });
-    });
   }
 
   function renderGraph() {
@@ -621,7 +523,6 @@ def analyze_repository(repo_url):
       html += `</div>`;
       html += buildCausalGraphSVG(chain, NODE_COLORS);
       graphPanelBody.innerHTML = html;
-      initGraphPanZoom();
 
     } else if (ghCommits.length > 0) {
       // Build intent graph from real commits
