@@ -243,15 +243,21 @@ def analyze_repository(repo_url):
         // Do NOT fall through to /query against a half-written graph --
         // that produced silently wrong/partial node counts (e.g. 12 of 35
         // commits) with no visible error. Surface it instead.
+        //
+        // IMPORTANT: this used to `return` here, which also skipped the
+        // /github/fetch + /github/all_commits calls below -- meaning the
+        // commit->commit fallback graph/timeline (which exist specifically
+        // for the case where the causal Neo4j chain is unavailable) never
+        // even got a chance to run. Ingest timing out is exactly the case
+        // the fallback is for, so we now fall through instead of bailing.
         state.dm_error = "Repo ingest did not finish in time (or failed) -- " +
-          "the causal graph may be incomplete or stale. Try Analyze again " +
-          "in a moment, or check backend logs for the ingest run.";
+          "the causal graph may be incomplete or stale. Showing what's " +
+          "available from GitHub directly while you retry.";
+        state.dm_result = null;
         state.dm_loaded = true;
         state.dm_loading = false;
         renderAll();
-        return;
-      }
-
+      } else {
       // POST /query
       try {
         const resp = await postJSON("/query", { query: queryText }, 70000);
@@ -274,9 +280,13 @@ def analyze_repository(repo_url):
       } finally {
         state.dm_loading = false;
       }
+      } // end else (ingestOk)
     }
 
     // POST /github/fetch for repo metadata + /github/all_commits for full history
+    // Runs regardless of whether ingest/query succeeded -- this is the
+    // fallback path (commit->commit intent graph + timeline) and must not
+    // be skipped just because the causal Neo4j chain has no data yet.
     try {
       const ghResp = await postJSON("/github/fetch", { url: state.dm_repo, per_branch_limit: 30 }, 60000);
       if (ghResp.status === 200) {
