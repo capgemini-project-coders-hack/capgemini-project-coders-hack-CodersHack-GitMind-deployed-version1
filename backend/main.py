@@ -863,10 +863,19 @@ def github_all_commits(payload: GitHubFetchRequest) -> dict[str, Any]:
 
     branch_names = [b["name"] if isinstance(b, dict) else b for b in branches_raw]
 
+    # Cap to GITMIND_MAX_PAGES (default 1) to avoid fetching all branches
+    # of large repos like apache/kafka which has 92 branches.
+    max_pages = int(_os.getenv("GITMIND_MAX_PAGES", "1"))
+
+    # Also cap to trunk/main branch only if GITMIND_INGEST_BRANCH is set
+    pinned_branch = _os.getenv("GITMIND_INGEST_BRANCH", "")
+    if pinned_branch and pinned_branch in branch_names:
+        branch_names = [pinned_branch]
+
     all_commits: dict[str, Any] = {}
     for branch in branch_names:
         try:
-            commits = github_api.list_all_commits(owner, repo, branch, token=token)
+            commits = github_api.list_all_commits(owner, repo, branch, token=token, max_pages=max_pages)
             all_commits[branch] = [
                 {
                     "sha": c.get("sha", ""),
