@@ -281,8 +281,10 @@ def analyze_repository(repo_url):
       const ghResp = await postJSON("/github/fetch", { url: state.dm_repo, per_branch_limit: 30 }, 60000);
       if (ghResp.status === 200) {
         state.dm_github = await ghResp.json();
-        state.dm_selected_branch = state.dm_github.default_branch ||
-          (state.dm_github.branches && state.dm_github.branches[0]) || "";
+        {
+          const initialPick = pickBranchWithCommits(state.dm_github, null, state.dm_github.default_branch);
+          state.dm_selected_branch = initialPick.branch;
+        }
         state.dm_commit_pages = {};
         renderAll(); // re-render now that real GitHub data is available
 
@@ -313,10 +315,19 @@ def analyze_repository(repo_url):
         state.dm_rate_limit_error = errData.detail || "GitHub API rate limit reached. The backend needs a GITHUB_TOKEN environment variable set on Render.";
         renderAll();
       } else {
+        // Previously missing renderAll() here -- on any non-200/429
+        // response (502 from a branch-fetch exception, etc.) the UI just
+        // froze on whatever was rendered before this call, with no visible
+        // error and no update, instead of showing the graph/traces that
+        // may have already succeeded from /query above.
         state.dm_github = null;
+        renderAll();
       }
     } catch (err) {
+      // Same gap on network error / timeout -- the previous fix only
+      // covered the explicit 429 branch, the generic catch never got it.
       state.dm_github = null;
+      renderAll();
     }
 
     // Fetch ALL commits across ALL branches for whole-repo analysis
@@ -631,6 +642,37 @@ def analyze_repository(repo_url):
     }
   }
 
+  // Picks a branch to actually render commits for. Previously every call
+  // site (timeline, repo explorer, commit-detail seeding) trusted
+  // state.dm_selected_branch directly -- if that branch's entry in
+  // gh.commits was empty (a branch that 403'd mid-loop in /github/fetch,
+  // or a stale selection left over from switching repos) the UI just
+  // showed "no commits" even when other branches in the SAME response
+  // clearly had data. This walks: preferred branch -> default_branch ->
+  // first branch with any commits at all, and returns whichever actually
+  // has something, plus a flag noting whether it had to fall back.
+  function pickBranchWithCommits(gh, allCommits, preferredBranch) {
+    if (!gh) return { branch: preferredBranch || "", commits: [], fellBack: false };
+
+    const candidates = [];
+    if (preferredBranch) candidates.push(preferredBranch);
+    if (gh.default_branch && gh.default_branch !== preferredBranch) candidates.push(gh.default_branch);
+    for (const b of (gh.branches || [])) {
+      if (!candidates.includes(b)) candidates.push(b);
+    }
+
+    for (let i = 0; i < candidates.length; i++) {
+      const b = candidates[i];
+      const fromAll = (allCommits && allCommits.commits_by_branch && allCommits.commits_by_branch[b]) || [];
+      const fromGh = (gh.commits && gh.commits[b]) || [];
+      const commits = fromAll.length ? fromAll : fromGh;
+      if (commits.length) {
+        return { branch: b, commits, fellBack: i > 0 };
+      }
+    }
+    return { branch: preferredBranch || gh.default_branch || "", commits: [], fellBack: false };
+  }
+
   function renderTimeline() {
     let body;
     if (state.dm_loaded) {
@@ -652,16 +694,19 @@ def analyze_repository(repo_url):
         body = `<div class="dm-timeline">${items}</div>`;
 
       } else if (state.dm_github) {
-        // Real commits from GitHub fetch — use selected branch or default
+        // Real commits from GitHub fetch — use selected branch, falling
+        // back to any branch that actually has data rather than showing
+        // empty just because the selected one came back empty.
         const gh = state.dm_github;
-        const branch = state.dm_selected_branch || gh.default_branch || "";
-        const branchCommits = (gh.commits && gh.commits[branch]) || [];
-        // Also try all_commits
-        const allBranchCommits = (state.dm_all_commits && state.dm_all_commits.commits_by_branch && state.dm_all_commits.commits_by_branch[branch]) || branchCommits;
-        const commits = allBranchCommits.slice(0, 20);
+        const picked = pickBranchWithCommits(gh, state.dm_all_commits, state.dm_selected_branch);
+        const branch = picked.branch;
+        const commits = picked.commits.slice(0, 20);
 
         if (commits.length) {
           let items = "";
+          if (picked.fellBack) {
+            items += `<div class="dm-tl-meta" style="margin-bottom:8px;color:#92400E;">⚠ "${escapeHtml(state.dm_selected_branch || "")}" had no commit data — showing "${escapeHtml(branch)}" instead.</div>`;
+          }
           commits.forEach((c) => {
             const sha = (c.sha || "").slice(0, 8);
             const msg = (c.message || (((c.commit||{}).message)||"")).split("\n")[0].slice(0, 80);
