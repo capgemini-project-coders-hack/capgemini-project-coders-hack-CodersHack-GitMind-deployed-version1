@@ -294,14 +294,24 @@ def ingest_tickets(driver, project: str | None = None, max_results: int = 5000) 
     jira_token = os.getenv("JIRA_API_TOKEN", "")
     project    = project or os.getenv("JIRA_DEFAULT_PROJECT", "")
 
-    if not jira_url or not jira_user or not jira_token:
-        log.warning("Jira env vars (JIRA_URL, JIRA_USER, JIRA_API_TOKEN) not set — skipping ticket ingestion.")
+    if not jira_url:
+        log.warning("JIRA_URL not set — skipping ticket ingestion.")
         return
     if not project:
         log.warning("JIRA_DEFAULT_PROJECT not set — skipping ticket ingestion.")
         return
 
-    auth       = HTTPBasicAuth(jira_user, jira_token)
+    # Auth is optional — Apache Jira (issues.apache.org) is public, no auth needed.
+    # Atlassian Cloud requires JIRA_USER + JIRA_API_TOKEN.
+    auth = HTTPBasicAuth(jira_user, jira_token) if jira_user and jira_token else None
+
+    # Apache uses REST API v2; Atlassian Cloud uses v3/search/jql.
+    # Detect by whether the URL contains "atlassian.net".
+    is_atlassian_cloud = "atlassian.net" in jira_url
+    search_url = (
+        f"{jira_url}/rest/api/3/search/jql" if is_atlassian_cloud
+        else f"{jira_url}/rest/api/2/search"
+    )
 
     log.info("Fetching Jira tickets for project %s...", project)
 
@@ -317,17 +327,12 @@ def ingest_tickets(driver, project: str | None = None, max_results: int = 5000) 
             "fields":     "summary,description,status,priority,issuetype,"
                           "assignee,reporter,created,updated,resolutiondate,labels",
         }
-        if next_page_token:
+        if is_atlassian_cloud and next_page_token:
             params["nextPageToken"] = next_page_token
+        elif not is_atlassian_cloud:
+            params["startAt"] = start_at
 
-        resp = requests.get(
-            # /rest/api/3/search was removed by Atlassian (410 Gone, final
-            # shutdown Oct 2025) — /search/jql is the replacement and
-            # paginates via nextPageToken/isLast instead of startAt.
-            f"{jira_url}/rest/api/3/search/jql",
-            params=params,
-            auth=auth, timeout=30,
-        )
+        resp = requests.get(search_url, params=params, auth=auth, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         issues = data.get("issues", [])
