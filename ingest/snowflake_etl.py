@@ -380,10 +380,13 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
              src.message, src.timestamp, src.files_changed, src.additions,
              src.deletions, src.patch_summary, src.url)
         """
-        upserted = 0
-        for row in rows:
-            cur.execute(merge_sql, row)
-            upserted += 1
+        # cur.execute() in a loop was one network round-trip to Snowflake
+        # PER COMMIT -- the second hidden bottleneck after the GitHub diff-
+        # stat fetch. executemany() batches the binds into far fewer
+        # round-trips (the connector groups them internally).
+        if rows:
+            cur.executemany(merge_sql, rows)
+        upserted = len(rows)
         log.info("  Upserted %d/%d commits.", upserted, len(rows))
     finally:
         cur.close()
@@ -490,8 +493,8 @@ def ingest_tickets(project: str | None = None, max_results: int = 5000) -> None:
              src.status, src.priority, src.issue_type, src.assignee,
              src.created_at, src.url, src.is_bug)
         """
-        for row in rows:
-            cur.execute(merge_sql, row)
+        if rows:
+            cur.executemany(merge_sql, rows)
         log.info("  Upserted %d tickets.", len(rows))
     finally:
         cur.close()
@@ -591,8 +594,8 @@ def ingest_messages(channel_id: str, limit_days: int = 90) -> None:
             (src.message_id, src.channel_id, src.channel_name, src.user_id,
              src.username, src.text, src.summary, src.timestamp, src.thread_ts)
         """
-        for row in rows:
-            cur.execute(merge_sql, row)
+        if rows:
+            cur.executemany(merge_sql, rows)
         log.info("  Upserted %d messages.", len(rows))
     finally:
         cur.close()
@@ -678,8 +681,8 @@ def ingest_adrs(repo: str, adr_path: str = "docs/adr") -> None:
              src.status, src.context, src.decision, src.consequences,
              src.raw_markdown, src.created_date)
         """
-        for row in rows:
-            cur.execute(merge_sql, row)
+        if rows:
+            cur.executemany(merge_sql, rows)
         log.info("  Upserted %d ADR records.", len(rows))
     finally:
         cur.close()
