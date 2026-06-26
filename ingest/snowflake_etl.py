@@ -32,7 +32,6 @@ import os
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
@@ -170,7 +169,7 @@ CREATE TABLE IF NOT EXISTS DECISIONS (
 ALL_TABLES = ["COMMITS", "TICKETS", "MESSAGES", "ADR_RECORDS", "BUG_REPORTS", "DECISIONS"]
 
 
-def run_ddl(conn, close: bool = True) -> None:
+def run_ddl(conn) -> None:
     log.info("Creating tables (IF NOT EXISTS)...")
     cur = conn.cursor()
     try:
@@ -181,8 +180,7 @@ def run_ddl(conn, close: bool = True) -> None:
         log.info("DDL complete — 6 tables ready.")
     finally:
         cur.close()
-        if close:
-            conn.close()
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +231,7 @@ def _list_branches(owner: str, repo_name: str, headers: dict) -> list[str]:
     return branches
 
 
-def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10, conn=None) -> None:
+def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None:
     # max_pages=10 * per_page=100 = 1000 commits cap PER BRANCH.
     # `branch` is kept only for CLI back-compat and ignored below: commits
     # are now pulled for EVERY branch (deduped by sha), matching
@@ -278,49 +276,7 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10, conn=No
             if len(batch) < 100:
                 break
 
-    log.info("  %d unique commits fetched across all branches; enriching with diff stats (parallel)...", len(commits_by_sha))
-
-    def _fetch_diff_stats(sha: str) -> tuple[str, dict]:
-        # GitHub's secondary/abuse rate limit isn't tied to a fixed request
-        # count -- it trips on burst concurrency + rate over a rolling
-        # window, so there's no "after N commits" number to hardcode.
-        # Instead: detect it (403 + Retry-After, or the abuse-detection
-        # message) and back off + retry, which adapts correctly regardless
-        # of repo size instead of guessing a "safe" worker count up front.
-        max_attempts = 5
-        for attempt in range(1, max_attempts + 1):
-            try:
-                resp = requests.get(
-                    f"https://api.github.com/repos/{owner}/{repo_name}/commits/{sha}",
-                    headers=headers, timeout=15,
-                )
-                if resp.status_code == 403:
-                    retry_after = resp.headers.get("Retry-After")
-                    wait = float(retry_after) if retry_after else min(2 ** attempt, 30)
-                    log.warning("    Rate-limited fetching %s (attempt %d/%d) -- waiting %.1fs",
-                                sha[:7], attempt, max_attempts, wait)
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
-                return sha, resp.json()
-            except Exception:
-                if attempt == max_attempts:
-                    return sha, {}
-                time.sleep(min(2 ** attempt, 30))
-        return sha, {}
-
-    # These per-commit GET requests are independent of each other -- doing
-    # them sequentially was the single biggest cost in the whole ingest
-    # pipeline (N commits = N back-to-back network round-trips). A small
-    # bounded thread pool collapses that to roughly one round-trip's worth
-    # of wall-clock time, while the retry/backoff above absorbs any
-    # secondary rate-limit hits instead of needing a fixed worker count.
-    diff_stats_by_sha: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [pool.submit(_fetch_diff_stats, sha) for sha in commits_by_sha]
-        for future in as_completed(futures):
-            sha, detail = future.result()
-            diff_stats_by_sha[sha] = detail
+    log.info("  %d unique commits fetched across all branches; enriching with diff stats...", len(commits_by_sha))
 
     rows: list[tuple] = []
     for sha, entry in commits_by_sha.items():
@@ -330,16 +286,25 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10, conn=No
         author_data = commit_data.get("author") or {}
         message     = commit_data.get("message", "")
 
-        detail = diff_stats_by_sha.get(sha, {})
-        stats = detail.get("stats", {})
-        additions = stats.get("additions", 0)
-        deletions = stats.get("deletions", 0)
-        files = detail.get("files", [])
-        files_changed = len(files)
-        patch_summary = "; ".join(
-            f"{f.get('filename','?')} +{f.get('additions',0)}/-{f.get('deletions',0)}"
-            for f in files[:10]
-        )[:8000]
+        # Fetch diff stats per commit
+        additions = deletions = files_changed = 0
+        patch_summary = ""
+        try:
+            detail = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo_name}/commits/{sha}",
+                headers=headers, timeout=15,
+            ).json()
+            stats = detail.get("stats", {})
+            additions = stats.get("additions", 0)
+            deletions = stats.get("deletions", 0)
+            files = detail.get("files", [])
+            files_changed = len(files)
+            patch_summary = "; ".join(
+                f"{f.get('filename','?')} +{f.get('additions',0)}/-{f.get('deletions',0)}"
+                for f in files[:10]
+            )[:8000]
+        except Exception:
+            pass
 
         rows.append((
             sha,
@@ -356,8 +321,7 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10, conn=No
             c.get("html_url", ""),
         ))
 
-    own_conn = conn is None
-    conn = conn or _get_conn()
+    conn = _get_conn()
     cur = conn.cursor()
     try:
         merge_sql = """
@@ -382,18 +346,14 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10, conn=No
              src.message, src.timestamp, src.files_changed, src.additions,
              src.deletions, src.patch_summary, src.url)
         """
-        # cur.execute() in a loop was one network round-trip to Snowflake
-        # PER COMMIT -- the second hidden bottleneck after the GitHub diff-
-        # stat fetch. executemany() batches the binds into far fewer
-        # round-trips (the connector groups them internally).
-        if rows:
-            cur.executemany(merge_sql, rows)
-        upserted = len(rows)
+        upserted = 0
+        for row in rows:
+            cur.execute(merge_sql, row)
+            upserted += 1
         log.info("  Upserted %d/%d commits.", upserted, len(rows))
     finally:
         cur.close()
-        if own_conn:
-            conn.close()
+        conn.close()
     log.info("ETL done.")
 
 
@@ -401,14 +361,22 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10, conn=No
 # Step 3: Tickets (Jira)
 # ---------------------------------------------------------------------------
 
-def ingest_tickets(project: str | None = None, max_results: int = 5000, conn=None) -> None:
+def ingest_tickets(project: str | None = None, max_results: int = 5000) -> None:
     import requests
     from requests.auth import HTTPBasicAuth
 
-    jira_url = _require("JIRA_URL").rstrip("/")
-    jira_user = _require("JIRA_USER")
-    jira_token = _require("JIRA_API_TOKEN")
-    project = project or os.getenv("JIRA_DEFAULT_PROJECT", "PLAT")
+    jira_url = os.getenv("JIRA_URL", "").rstrip("/")
+    jira_user = os.getenv("JIRA_USER", "")
+    jira_token = os.getenv("JIRA_API_TOKEN", "")
+    project = project or os.getenv("JIRA_DEFAULT_PROJECT", "")
+
+    if not jira_url or not jira_user or not jira_token:
+        log.warning("Jira env vars (JIRA_URL, JIRA_USER, JIRA_API_TOKEN) not set — skipping ticket ingestion.")
+        return
+    if not project:
+        log.warning("JIRA_DEFAULT_PROJECT not set — skipping ticket ingestion.")
+        return
+
     auth = HTTPBasicAuth(jira_user, jira_token)
 
     log.info("Fetching Jira tickets for project %s...", project)
@@ -473,8 +441,7 @@ def ingest_tickets(project: str | None = None, max_results: int = 5000, conn=Non
         if data.get("isLast", not next_page_token) or start_at >= max_results:
             break
 
-    own_conn = conn is None
-    conn = conn or _get_conn()
+    conn = _get_conn()
     cur = conn.cursor()
     try:
         merge_sql = """
@@ -497,13 +464,12 @@ def ingest_tickets(project: str | None = None, max_results: int = 5000, conn=Non
              src.status, src.priority, src.issue_type, src.assignee,
              src.created_at, src.url, src.is_bug)
         """
-        if rows:
-            cur.executemany(merge_sql, rows)
+        for row in rows:
+            cur.execute(merge_sql, row)
         log.info("  Upserted %d tickets.", len(rows))
     finally:
         cur.close()
-        if own_conn:
-            conn.close()
+        conn.close()
     log.info("ETL done.")
 
 
@@ -521,7 +487,7 @@ def _adf_to_text(adf: dict) -> str:
 # Step 4: Slack → MESSAGES
 # ---------------------------------------------------------------------------
 
-def ingest_messages(channel_id: str, limit_days: int = 90, conn=None) -> None:
+def ingest_messages(channel_id: str, limit_days: int = 90) -> None:
     import requests
 
     token = _require("SLACK_BOT_TOKEN")
@@ -579,8 +545,7 @@ def ingest_messages(channel_id: str, limit_days: int = 90, conn=None) -> None:
         if not cursor:
             break
 
-    own_conn = conn is None
-    conn = conn or _get_conn()
+    conn = _get_conn()
     cur = conn.cursor()
     try:
         merge_sql = """
@@ -600,13 +565,12 @@ def ingest_messages(channel_id: str, limit_days: int = 90, conn=None) -> None:
             (src.message_id, src.channel_id, src.channel_name, src.user_id,
              src.username, src.text, src.summary, src.timestamp, src.thread_ts)
         """
-        if rows:
-            cur.executemany(merge_sql, rows)
+        for row in rows:
+            cur.execute(merge_sql, row)
         log.info("  Upserted %d messages.", len(rows))
     finally:
         cur.close()
-        if own_conn:
-            conn.close()
+        conn.close()
     log.info("ETL done.")
 
 
@@ -614,7 +578,7 @@ def ingest_messages(channel_id: str, limit_days: int = 90, conn=None) -> None:
 # Step 5: ADRs
 # ---------------------------------------------------------------------------
 
-def ingest_adrs(repo: str, adr_path: str = "docs/adr", conn=None) -> None:
+def ingest_adrs(repo: str, adr_path: str = "docs/adr") -> None:
     import requests
 
     token = os.getenv("GITHUB_TOKEN")
@@ -665,8 +629,7 @@ def ingest_adrs(repo: str, adr_path: str = "docs/adr", conn=None) -> None:
             created_date,
         ))
 
-    own_conn = conn is None
-    conn = conn or _get_conn()
+    conn = _get_conn()
     cur = conn.cursor()
     try:
         merge_sql = """
@@ -689,13 +652,12 @@ def ingest_adrs(repo: str, adr_path: str = "docs/adr", conn=None) -> None:
              src.status, src.context, src.decision, src.consequences,
              src.raw_markdown, src.created_date)
         """
-        if rows:
-            cur.executemany(merge_sql, rows)
+        for row in rows:
+            cur.execute(merge_sql, row)
         log.info("  Upserted %d ADR records.", len(rows))
     finally:
         cur.close()
-        if own_conn:
-            conn.close()
+        conn.close()
     log.info("ETL done.")
 
 
@@ -708,7 +670,7 @@ def _extract_section(text: str, pattern: str) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv: list[str] | None = None, conn=None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GitMind Snowflake ETL")
     parser.add_argument("--step", default="all",
                         choices=["all", "ddl", "commits", "tickets", "messages", "adrs", "reset"])
@@ -725,7 +687,7 @@ def main(argv: list[str] | None = None, conn=None) -> int:
 
     if step == "reset":
         try:
-            reset_all(conn=conn)
+            reset_all()
         except Exception as exc:
             log.error("reset step failed: %s", exc)
             return 1
@@ -734,7 +696,7 @@ def main(argv: list[str] | None = None, conn=None) -> int:
 
     if step in ("all", "ddl"):
         try:
-            run_ddl(conn or _get_conn(), close=conn is None)
+            run_ddl(_get_conn())
         except Exception as exc:
             log.error("ddl step failed: %s", exc)
             if step != "all":
@@ -748,13 +710,13 @@ def main(argv: list[str] | None = None, conn=None) -> int:
                 return 1
         else:
             try:
-                ingest_commits(repo, branch=args.branch, max_pages=args.max_pages, conn=conn)
+                ingest_commits(repo, branch=args.branch, max_pages=args.max_pages)
             except Exception as exc:
                 log.error("commits step failed: %s", exc)
 
     if step in ("all", "tickets"):
         try:
-            ingest_tickets(project=args.project, conn=conn)
+            ingest_tickets(project=args.project)
         except Exception as exc:
             log.error("tickets step failed: %s", exc)
 
@@ -764,7 +726,7 @@ def main(argv: list[str] | None = None, conn=None) -> int:
             log.warning("No channel set — skipping messages step.")
         else:
             try:
-                ingest_messages(channel, conn=conn)
+                ingest_messages(channel)
             except Exception as exc:
                 log.error("messages step failed: %s", exc)
 
@@ -774,7 +736,7 @@ def main(argv: list[str] | None = None, conn=None) -> int:
             log.warning("No repo set — skipping adrs step.")
         else:
             try:
-                ingest_adrs(repo, adr_path=args.adr_path, conn=conn)
+                ingest_adrs(repo, adr_path=args.adr_path)
             except Exception as exc:
                 log.error("adrs step failed: %s", exc)
 
