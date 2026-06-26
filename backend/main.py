@@ -730,6 +730,20 @@ def fetch_github_repo(payload: GitHubFetchRequest) -> dict[str, Any]:
 
     branch_names = [b["name"] if isinstance(b, dict) else b for b in branches]
 
+    # Same cap as /github/all_commits below — without this, a repo with
+    # many branches (apache/kafka has 92) makes this loop one GitHub API
+    # call per branch at minimum, which at the throttled 0.75s/call gap
+    # alone exceeds the frontend's 60s timeout for this endpoint before
+    # GitHub rate limiting even becomes a factor. When that timeout fires,
+    # the frontend sets dm_github = null and the commit-list/timeline UI
+    # panels go empty -- even though the causal graph (a separate pipeline,
+    # /ingest/repo + /query) may have populated correctly. Two independent
+    # pipelines, one fixed here, the other previously wasn't; this brings
+    # /github/fetch in line with /github/all_commits's existing fix.
+    pinned_branch = _os.getenv("GITMIND_INGEST_BRANCH", "")
+    if pinned_branch and pinned_branch in branch_names:
+        branch_names = [pinned_branch]
+
     result: dict[str, Any] = {
         "owner": owner,
         "repo": repo,
@@ -748,8 +762,17 @@ def fetch_github_repo(payload: GitHubFetchRequest) -> dict[str, Any]:
         except Exception as exc:
             exc_str = str(exc)
             if "403" in exc_str or "rate limit" in exc_str.lower():
-                raise HTTPException(status_code=429, detail="GitHub API rate limit reached. Set GITHUB_TOKEN on the backend.")
-            commits = []
+                # Previously this raised HTTPException(429) immediately,
+                # which discarded every branch already fetched before this
+                # one in the loop -- one rate-limited branch out of e.g. 92
+                # nuked the entire response, including branches 1 through
+                # (n-1) that had already succeeded. Now: log it, return []
+                # for THIS branch only, and let every other branch's data
+                # (already gathered, or gathered after this one) survive.
+                log.warning("GitHub rate limit hit fetching branch %s for %s/%s -- returning [] for this branch only", b_name, owner, repo)
+                commits = []
+            else:
+                commits = []
 
         # Return lightweight commit list only — no per-commit detail calls.
         # Detail (files/patches) fetched on demand via GET /github/commits/{sha}.
