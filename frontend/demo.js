@@ -750,7 +750,12 @@ def analyze_repository(repo_url):
     };
 
     loadCommitsPage();
-    loadFileExplorer();
+    // Guard: only load file explorer once — it makes expensive API calls
+    // (list_files + file_content) and renderAll() fires multiple times.
+    if (!state.dm_file_explorer_loaded) {
+      state.dm_file_explorer_loaded = true;
+      loadFileExplorer();
+    }
   }
 
   async function loadCommitsPage() {
