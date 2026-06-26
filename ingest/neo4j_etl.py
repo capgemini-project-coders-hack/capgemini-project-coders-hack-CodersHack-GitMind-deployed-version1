@@ -208,9 +208,14 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
 
     owner, repo_name = repo.split("/", 1)
 
-    branches = _list_branches(owner, repo_name, headers)
-    if not branches:
-        branches = [branch]  # fallback if /branches call returns nothing
+    pinned = os.getenv("GITMIND_INGEST_BRANCH", "")
+    if pinned:
+        branches = [pinned]
+        log.info("Branch pinned to '%s' via GITMIND_INGEST_BRANCH", pinned)
+    else:
+        branches = _list_branches(owner, repo_name, headers)
+        if not branches:
+            branches = [branch]
 
     log.info("Fetching commits from %s across %d branch(es) (max %d pages / %d commits per branch)...",
               repo, len(branches), max_pages, max_pages * 100)
