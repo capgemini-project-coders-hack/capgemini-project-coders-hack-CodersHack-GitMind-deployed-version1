@@ -34,7 +34,7 @@ def _first(csv_env: str) -> str:
     return parts[0] if parts else ""
 
 
-def _run_step(label: str, fn, argv: list[str]) -> int:
+def _run_step(label: str, fn, argv: list[str], **kwargs) -> int:
     """Run one ETL CLI invocation, catching anything it raises.
 
     Neither snowflake_etl.main() nor neo4j_etl.main() catch exceptions
@@ -47,7 +47,7 @@ def _run_step(label: str, fn, argv: list[str]) -> int:
     """
     log.info("=== %s ===", label)
     try:
-        rc = fn(argv)
+        rc = fn(argv, **kwargs)
         if rc:
             log.error("%s exited with code %s", label, rc)
         return rc or 0
@@ -83,12 +83,21 @@ def main() -> int:
     # --- Snowflake -----------------------------------------------------
     from ingest import snowflake_etl
 
-    overall_rc |= _run_step("Snowflake ETL: ddl", snowflake_etl.main, ["--step", "ddl"])
-    overall_rc |= _run_step("Snowflake ETL: commits", snowflake_etl.main, ["--step", "commits", *base_args])
-    overall_rc |= _run_step("Snowflake ETL: tickets", snowflake_etl.main, ["--step", "tickets", *base_args])
-    if channel:
-        overall_rc |= _run_step("Snowflake ETL: messages", snowflake_etl.main, ["--step", "messages", "--channel", channel])
-    overall_rc |= _run_step("Snowflake ETL: adrs", snowflake_etl.main, ["--step", "adrs", *base_args])
+    # Each step below used to open its own Snowflake connection (ddl,
+    # commits, tickets, adrs = up to 4 separate connect() handshakes per
+    # ingest run, ~2.5-4s each). They're all hitting the same database in
+    # the same run, so one connection shared across all of them removes
+    # that repeated handshake cost entirely.
+    sf_conn = snowflake_etl._get_conn()
+    try:
+        overall_rc |= _run_step("Snowflake ETL: ddl", snowflake_etl.main, ["--step", "ddl"], conn=sf_conn)
+        overall_rc |= _run_step("Snowflake ETL: commits", snowflake_etl.main, ["--step", "commits", *base_args], conn=sf_conn)
+        overall_rc |= _run_step("Snowflake ETL: tickets", snowflake_etl.main, ["--step", "tickets", *base_args], conn=sf_conn)
+        if channel:
+            overall_rc |= _run_step("Snowflake ETL: messages", snowflake_etl.main, ["--step", "messages", "--channel", channel], conn=sf_conn)
+        overall_rc |= _run_step("Snowflake ETL: adrs", snowflake_etl.main, ["--step", "adrs", *base_args], conn=sf_conn)
+    finally:
+        sf_conn.close()
 
     # --- Neo4j -----------------------------------------------------------
     from ingest import neo4j_etl
