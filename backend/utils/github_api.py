@@ -104,9 +104,34 @@ def get_repo_info(owner: str, repo: str, token: str | None = None) -> dict[str, 
 
 
 def list_branches(owner: str, repo: str, token: str | None = None) -> list[dict[str, Any]]:
-    resp = _get(f"{GITHUB_API}/repos/{owner}/{repo}/branches", token, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+    # Previously a single unpaginated GET -- GitHub defaults to per_page=30
+    # when it's not specified, so repos with more branches than that (e.g.
+    # apache/kafka has 90+) silently lost every branch past page 1. For
+    # Kafka specifically this cut "trunk" (the actual default branch) out
+    # of the list entirely, which broke GITMIND_INGEST_BRANCH pinning
+    # downstream in /github/fetch: the pin check is `pinned_branch in
+    # branch_names`, and trunk was never in branch_names to begin with --
+    # not because the pin was misconfigured, but because this call never
+    # fetched it. Paginating fixes the pin and gives an accurate full
+    # branch list for any repo, large or small.
+    all_branches: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        resp = _get(
+            f"{GITHUB_API}/repos/{owner}/{repo}/branches",
+            token,
+            params={"per_page": 100, "page": page},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        all_branches.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return all_branches
 
 
 def list_commits(
