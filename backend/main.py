@@ -66,9 +66,19 @@ class GitHubFetchRequest(BaseModel):
 
 
 class RepoIngestRequest(BaseModel):
-    """Body for POST /ingest/repo — any public GitHub repo, on demand."""
+    """Body for POST /ingest/repo — any public GitHub repo, on demand.
+
+    jira_project / adr_path are optional per-request overrides. Without
+    them, ingestion falls back to JIRA_DEFAULT_PROJECT / GITMIND_ADR_PATH
+    from the environment — which only matches the ONE repo a deployment
+    happened to be set up for. Passing them explicitly lets a single
+    deployment ingest a different repo, with a different Jira project and
+    a different ADR location, on every call.
+    """
     repo: str = Field(..., min_length=3, description="owner/repo, or a full GitHub URL")
     branch: str = Field(default="main")
+    jira_project: str = Field(default="", description="Jira project key for this repo, e.g. 'PROJ'. Falls back to JIRA_DEFAULT_PROJECT if omitted.")
+    adr_path: str = Field(default="", description="Path to this repo's ADR folder, e.g. 'docs/adr'. Falls back to GITMIND_ADR_PATH (default 'docs/adr') if omitted.")
 
 
 class SnowflakeDetails:
@@ -480,7 +490,12 @@ _repo_ingest_state: dict[str, Any] = {
 }
 
 
-def _run_repo_ingest_job(repo: str, branch: str) -> None:
+def _run_repo_ingest_job(
+    repo: str,
+    branch: str,
+    jira_project: str = "",
+    adr_path: str = "",
+) -> None:
     import io
 
     _repo_ingest_state["running"] = True
@@ -513,10 +528,24 @@ def _run_repo_ingest_job(repo: str, branch: str) -> None:
         except Exception as exc:
             log.warning("Neo4j reset failed (continuing): %s", exc)
 
-        # Reuse run_ingest's per-step isolation by pointing it at this repo.
-        _os.environ["GITMIND_INGEST_REPO"] = repo
-        from ingest.run_ingest import main as ingest_main
-        rc = ingest_main()
+        # Call the ingest pipeline directly with THIS request's values —
+        # repo, branch, Jira project, and ADR path are all per-call here,
+        # not read back off fixed env vars. That's what makes this work for
+        # any public repo: a repo whose Jira project or ADR folder differs
+        # from whatever the deployment's env vars happen to be set to still
+        # gets ingested correctly, because those values are explicit
+        # request fields, not assumed constants.
+        from ingest.run_ingest import run as ingest_run
+
+        channel = _os.environ.get("GITMIND_INGEST_CHANNEL") or _first_csv_env("SLACK_DEFAULT_CHANNELS")
+        rc = ingest_run(
+            repo=repo,
+            branch=branch,
+            channel=channel,
+            project=jira_project or _os.environ.get("JIRA_DEFAULT_PROJECT", ""),
+            adr_path=adr_path or _os.environ.get("GITMIND_ADR_PATH", "docs/adr"),
+            max_pages=_os.environ.get("GITMIND_MAX_PAGES", "2"),
+        )
 
         _repo_ingest_state["last_result"] = {
             "repo": repo, "exit_code": rc, "log": buf.getvalue()[-8000:]
@@ -533,9 +562,20 @@ def _run_repo_ingest_job(repo: str, branch: str) -> None:
         _repo_ingest_state["running"] = False
 
 
+def _first_csv_env(csv_env: str) -> str:
+    raw = _os.environ.get(csv_env, "")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return parts[0] if parts else ""
+
+
 @router.post("/ingest/repo")
 def ingest_repo(payload: RepoIngestRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
-    """Ingest any public GitHub repo on demand. Wipes prior repo's data first."""
+    """Ingest any public GitHub repo on demand. Wipes prior repo's data first.
+
+    repo is the only required field. jira_project / adr_path are optional —
+    set them when the repo being ingested doesn't use the deployment's
+    default Jira project or ADR folder.
+    """
     try:
         slug = normalize_repo_slug(payload.repo)
     except ValueError as exc:
@@ -544,8 +584,10 @@ def ingest_repo(payload: RepoIngestRequest, background_tasks: BackgroundTasks) -
     if _repo_ingest_state["running"]:
         return {"status": "already_running", "current_repo": _repo_ingest_state["current_repo"]}
 
-    background_tasks.add_task(_run_repo_ingest_job, slug, payload.branch)
-    return {"status": "started", "repo": slug}
+    background_tasks.add_task(
+        _run_repo_ingest_job, slug, payload.branch, payload.jira_project, payload.adr_path
+    )
+    return {"status": "started", "repo": slug, "branch": payload.branch}
 
 
 @router.get("/ingest/repo/status")
@@ -731,7 +773,7 @@ def fetch_github_repo(payload: GitHubFetchRequest) -> dict[str, Any]:
     branch_names = [b["name"] if isinstance(b, dict) else b for b in branches]
 
     # Same cap as /github/all_commits below — without this, a repo with
-    # many branches (apache/kafka has 92) makes this loop one GitHub API
+    # many branches (some repos have 90+) makes this loop one GitHub API
     # call per branch at minimum, which at the throttled 0.75s/call gap
     # alone exceeds the frontend's 60s timeout for this endpoint before
     # GitHub rate limiting even becomes a factor. When that timeout fires,
@@ -887,7 +929,7 @@ def github_all_commits(payload: GitHubFetchRequest) -> dict[str, Any]:
     branch_names = [b["name"] if isinstance(b, dict) else b for b in branches_raw]
 
     # Cap to GITMIND_MAX_PAGES (default 1) to avoid fetching all branches
-    # of large repos like apache/kafka which has 92 branches.
+    # of large repos that can have 90+ branches.
     max_pages = int(_os.getenv("GITMIND_MAX_PAGES", "1"))
 
     # Also cap to trunk/main branch only if GITMIND_INGEST_BRANCH is set
