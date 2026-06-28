@@ -249,13 +249,27 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
     owner, repo_name = repo.split("/", 1)
 
     pinned = os.getenv("GITMIND_INGEST_BRANCH", "")
+    branches = _list_branches(owner, repo_name, headers)
+    if not branches:
+        branches = [branch]
     if pinned:
-        branches = [pinned]
-        log.info("Branch pinned to '%s' via GITMIND_INGEST_BRANCH", pinned)
-    else:
-        branches = _list_branches(owner, repo_name, headers)
-        if not branches:
-            branches = [branch]
+        if pinned in branches:
+            branches = [pinned]
+            log.info("Branch pinned to '%s' via GITMIND_INGEST_BRANCH", pinned)
+        else:
+            # GITMIND_INGEST_BRANCH is a deployment-wide env var. If it was
+            # set for a previous repo (e.g. "trunk" for a repo whose default
+            # branch isn't "main"), it will not exist on a different repo
+            # ingested later -- pinning to it anyway 404s every commits/adrs
+            # call for that repo. Ignoring a pin that doesn't apply here and
+            # falling back to every real branch keeps ingest working for
+            # whatever repo was actually requested, instead of hard-failing
+            # because of a stale setting left over from a different one.
+            log.warning(
+                "GITMIND_INGEST_BRANCH='%s' does not exist on %s -- ignoring "
+                "the pin and using all %d branch(es) found instead.",
+                pinned, repo, len(branches),
+            )
 
     log.info("Fetching commits from %s across %d branch(es) (max %d pages / %d commits per branch)...",
               repo, len(branches), max_pages, max_pages * 100)
