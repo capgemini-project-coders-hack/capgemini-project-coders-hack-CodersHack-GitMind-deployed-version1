@@ -1,225 +1,172 @@
 """
-github_api.py — Thin wrapper around the GitHub REST API for GitMind
-=======================================================================
-Includes:
-  - _throttle(): enforces minimum gap between API calls (default 0.75s)
-  - _get(): single retry wrapper that honours 429/403 Retry-After headers
-  - GITHUB_API_MIN_GAP env var to tune throttle (default 0.75s)
+run_ingest.py — single entrypoint that drives snowflake_etl.py + neo4j_etl.py
+================================================================================
+Why this exists: both ETL scripts require --repo (commits/adrs step) and
+--channel (messages step) on the CLI, and `--step all` aborts on the very
+first missing one (see their `main()` — it returns 1 the moment a required
+arg is absent for the step it's currently on). Nothing in render.yaml was
+ever calling them with those args, so neither pipeline ever actually ran —
+that's why Snowflake/Neo4j stayed empty even though the tables/credentials
+were fine.
 
-With a GITHUB_TOKEN set: 5000 req/hr = safe at 0.75s gap.
-Without token: 60 req/hr = set GITHUB_TOKEN or expect rate limiting.
+This module works for ANY public GitHub repo, not just whatever repo the
+deployment happens to be configured for:
+
+  - `main()` is the CLI / scheduled-Job entrypoint. It pulls repo/channel/
+    project/adr_path from env vars (GITHUB_DEFAULT_REPOS, SLACK_DEFAULT_CHANNELS,
+    JIRA_DEFAULT_PROJECT, GITMIND_ADR_PATH) — this is the "one repo per
+    deployment" batch job, unchanged in behaviour.
+  - `run(**overrides)` is the actual worker and accepts explicit per-call
+    overrides for repo/branch/project/adr_path/channel/max_pages. The
+    backend's on-demand `/ingest/repo` endpoint calls this directly with
+    whatever the caller asked for, so a single deployment can ingest any
+    repo + any Jira project + any ADR path at request time, without
+    touching env vars or restarting anything.
+
+Run manually:    python -m ingest.run_ingest
+Run via Render:  configured as the gitmind-ingest Job's dockerCommand.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import re
-import time
-from typing import Any
-from urllib.parse import urlparse
+import sys
 
-import requests
-
-GITHUB_API = "https://api.github.com"
-log = logging.getLogger("gitmind.etl.snowflake")
-
-# Minimum seconds between ANY GitHub API call.
-# Authenticated = 5000 req/hr ≈ 1.38/s → 0.75s gap is safe.
-_MIN_CALL_GAP = float(os.getenv("GITHUB_API_MIN_GAP", "0.75"))
-_last_call_time: float = 0.0
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("gitmind.ingest")
 
 
-def _throttle() -> None:
-    global _last_call_time
-    elapsed = time.monotonic() - _last_call_time
-    wait = _MIN_CALL_GAP - elapsed
-    if wait > 0:
-        time.sleep(wait)
-    _last_call_time = time.monotonic()
+def _first(csv_env: str) -> str:
+    raw = os.environ.get(csv_env, "")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return parts[0] if parts else ""
 
 
-def _get(url: str, token: str | None, params: dict | None = None, timeout: int = 15) -> requests.Response:
-    """GitHub GET with throttle + smart retry on rate limit responses."""
-    max_retries = 3
-    resp = None
-    for attempt in range(1, max_retries + 1):
-        _throttle()
-        resp = requests.get(url, headers=_headers(token), params=params, timeout=timeout)
+def _run_step(label: str, fn, argv: list[str]) -> int:
+    """Run one ETL CLI invocation, catching anything it raises.
 
-        is_rate_limited = resp.status_code == 429 or (
-            resp.status_code == 403 and "rate limit" in resp.text.lower()
-        )
-        if not is_rate_limited:
-            return resp
+    Neither snowflake_etl.main() nor neo4j_etl.main() catch exceptions
+    raised inside their own step logic — they only have a `finally` to
+    close the connection. Left uncaught here, one bad step (e.g. GitHub
+    rate-limited, a malformed repo string) would kill this whole script
+    and silently skip every step after it — including the entire Neo4j
+    half, which is exactly the "no data, no graph" failure this is meant
+    to fix. Catching per-step keeps one failure from taking out the rest.
+    """
+    log.info("=== %s ===", label)
+    try:
+        rc = fn(argv)
+        if rc:
+            log.error("%s exited with code %s", label, rc)
+        return rc or 0
+    except Exception as exc:  # noqa: BLE001 - isolate, log, keep going
+        log.error("%s raised an uncaught exception: %s", label, exc, exc_info=True)
+        return 1
 
-        reset_at = int(resp.headers.get("X-RateLimit-Reset", 0))
-        retry_after = int(resp.headers.get("Retry-After", 0))
-        if reset_at:
-            wait = max(1, reset_at - int(time.time()) + 1)
-        elif retry_after:
-            wait = retry_after
-        else:
-            wait = 60 * attempt  # 60s, 120s, 180s
 
+def run(
+    *,
+    repo: str,
+    branch: str = "main",
+    channel: str = "",
+    project: str = "",
+    adr_path: str = "docs/adr",
+    max_pages: str | int = "2",
+) -> int:
+    """Run the full Snowflake + Neo4j ingest pipeline for one repo.
+
+    This is repo-agnostic: every value that differs between repos (the repo
+    itself, its default branch, its Jira project key, where its ADRs live)
+    is a parameter here, not a constant. Any public GitHub repo can be
+    passed in, along with whichever Jira project and ADR folder actually
+    apply to *that* repo — they don't have to match what a previous repo
+    used.
+    """
+    if not repo:
+        log.error("No repo to ingest — pass repo='owner/repo'. Aborting before either ETL runs.")
+        return 1
+    if not channel:
         log.warning(
-            "GitHub rate limited (attempt %d/%d) — waiting %ds",
-            attempt, max_retries, wait,
+            "No Slack channel set — skipping the 'messages' step for both "
+            "pipelines, running everything else."
         )
-        if attempt < max_retries:
-            time.sleep(wait)
 
-    resp.raise_for_status()
-    return resp
+    base_args = [
+        "--repo", repo,
+        "--branch", branch,
+        "--adr-path", adr_path,
+        "--max-pages", str(max_pages),
+    ]
+    if project:
+        base_args += ["--project", project]
 
+    overall_rc = 0
 
-def _headers(token: str | None) -> dict[str, str]:
-    headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
+    # --- Snowflake -----------------------------------------------------
+    from ingest import snowflake_etl
 
+    overall_rc |= _run_step("Snowflake ETL: ddl", snowflake_etl.main, ["--step", "ddl"])
+    overall_rc |= _run_step("Snowflake ETL: commits", snowflake_etl.main, ["--step", "commits", *base_args])
+    overall_rc |= _run_step("Snowflake ETL: tickets", snowflake_etl.main, ["--step", "tickets", *base_args])
+    if channel:
+        overall_rc |= _run_step("Snowflake ETL: messages", snowflake_etl.main, ["--step", "messages", "--channel", channel])
+    overall_rc |= _run_step("Snowflake ETL: adrs", snowflake_etl.main, ["--step", "adrs", *base_args])
 
-def parse_github_url(url: str) -> tuple[str, str, str, str]:
-    parsed = urlparse(url)
-    if "github.com" not in parsed.netloc:
-        raise ValueError("URL is not a github.com URL")
-    parts = [p for p in parsed.path.split("/") if p]
-    if len(parts) < 2:
-        raise ValueError("URL must include at least an owner and repo")
-    owner, repo = parts[0], parts[1]
-    repo = re.sub(r"\.git$", "", repo)
-    path = ""
-    ref = ""
-    if len(parts) > 3 and parts[2] in ("tree", "blob"):
-        ref = parts[3]
-        path = "/".join(parts[4:])
-    return owner, repo, path, ref
+    # --- Neo4j -----------------------------------------------------------
+    from ingest import neo4j_etl
 
+    overall_rc |= _run_step("Neo4j ETL: constraints", neo4j_etl.main, ["--step", "constraints"])
+    overall_rc |= _run_step("Neo4j ETL: commits", neo4j_etl.main, ["--step", "commits", *base_args])
+    overall_rc |= _run_step("Neo4j ETL: tickets", neo4j_etl.main, ["--step", "tickets", *base_args])
+    if channel:
+        overall_rc |= _run_step("Neo4j ETL: messages", neo4j_etl.main, ["--step", "messages", "--channel", channel])
+    overall_rc |= _run_step("Neo4j ETL: adrs", neo4j_etl.main, ["--step", "adrs", *base_args])
+    overall_rc |= _run_step("Neo4j ETL: edges", neo4j_etl.main, ["--step", "edges"])
 
-def get_repo_info(owner: str, repo: str, token: str | None = None) -> dict[str, Any]:
-    resp = _get(f"{GITHUB_API}/repos/{owner}/{repo}", token, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def list_branches(owner: str, repo: str, token: str | None = None) -> list[dict[str, Any]]:
-    # Previously a single unpaginated GET -- GitHub defaults to per_page=30
-    # when it's not specified, so repos with more branches than that (e.g.
-    # large mono-repos can have 90+) silently lost every branch past page 1.
-    # For a repo whose default branch isn't even in the first page, this
-    # cut the actual default branch out of the list entirely, which broke
-    # GITMIND_INGEST_BRANCH pinning
-    # downstream in /github/fetch: the pin check is `pinned_branch in
-    # branch_names`, and the pinned branch was never in branch_names to
-    # begin with -- not because the pin was misconfigured, but because
-    # this call never fetched it. Paginating fixes the pin and gives an
-    # accurate full branch list for any repo, large or small.
-    all_branches: list[dict[str, Any]] = []
-    page = 1
-    while True:
-        resp = _get(
-            f"{GITHUB_API}/repos/{owner}/{repo}/branches",
-            token,
-            params={"per_page": 100, "page": page},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        batch = resp.json()
-        if not batch:
-            break
-        all_branches.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
-    return all_branches
-
-
-def list_commits(
-    owner: str,
-    repo: str,
-    branch: str,
-    per_page: int = 30,
-    page: int = 1,
-    token: str | None = None,
-) -> list[dict[str, Any]]:
-    resp = _get(
-        f"{GITHUB_API}/repos/{owner}/{repo}/commits",
-        token,
-        params={"sha": branch, "per_page": per_page, "page": page},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_commit_detail(owner: str, repo: str, sha: str, token: str | None = None) -> dict[str, Any]:
-    resp = _get(f"{GITHUB_API}/repos/{owner}/{repo}/commits/{sha}", token, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def list_all_commits(
-    owner: str,
-    repo: str,
-    branch: str,
-    token: str | None = None,
-    max_pages: int = 10,
-) -> list[dict[str, Any]]:
-    all_commits: list[dict[str, Any]] = []
-    for page in range(1, max_pages + 1):
-        resp = _get(
-            f"{GITHUB_API}/repos/{owner}/{repo}/commits",
-            token,
-            params={"sha": branch, "per_page": 100, "page": page},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        batch = resp.json()
-        if not batch:
-            break
-        all_commits.extend(batch)
-        if len(batch) < 100:
-            break
-    return all_commits
-
-
-def list_repo_files(owner: str, repo: str, ref: str | None = None, token: str | None = None) -> list[str]:
-    if ref:
-        branch_resp = _get(f"{GITHUB_API}/repos/{owner}/{repo}/branches/{ref}", token, timeout=15)
-        if branch_resp.ok:
-            sha = branch_resp.json()["commit"]["sha"]
-        else:
-            sha = ref
+    if overall_rc:
+        log.error("One or more ETL steps failed — see logs above for which ones. Exiting non-zero.")
     else:
-        repo_info = get_repo_info(owner, repo, token=token)
-        default_branch = repo_info.get("default_branch", "main")
-        branch_resp = _get(f"{GITHUB_API}/repos/{owner}/{repo}/branches/{default_branch}", token, timeout=15)
-        branch_resp.raise_for_status()
-        sha = branch_resp.json()["commit"]["sha"]
+        log.info("Ingest complete: Snowflake + Neo4j both populated for %s.", repo)
+    return overall_rc
 
-    tree_resp = _get(
-        f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/{sha}",
-        token,
-        params={"recursive": "1"},
-        timeout=30,
+
+def main() -> int:
+    """CLI / scheduled-Job entrypoint — resolves everything from env vars.
+
+    Used by the standalone `gitmind-ingest` Job, which only ever targets the
+    one repo/project the deployment was configured with. The on-demand API
+    path (backend/main.py's /ingest/repo) does NOT go through this function
+    — it calls run() directly with per-request values instead, so it isn't
+    limited to whatever repo happens to be set here.
+    """
+    repo = os.environ.get("GITMIND_INGEST_REPO") or _first("GITHUB_DEFAULT_REPOS")
+    branch = os.environ.get("GITMIND_INGEST_BRANCH", "main")
+    channel = os.environ.get("GITMIND_INGEST_CHANNEL") or _first("SLACK_DEFAULT_CHANNELS")
+    project = os.environ.get("JIRA_DEFAULT_PROJECT", "")
+    adr_path = os.environ.get("GITMIND_ADR_PATH", "docs/adr")
+
+    if not repo:
+        log.error(
+            "No repo to ingest — set GITHUB_DEFAULT_REPOS (or GITMIND_INGEST_REPO) "
+            "to 'owner/repo'. Aborting before either ETL runs."
+        )
+        return 1
+
+    # GITMIND_MAX_PAGES caps commits per branch (100 commits/page).
+    # Default 2 = 200 commits — enough for a demo; safe even for repos with
+    # very long commit histories. Set higher on Render env for more nodes.
+    max_pages = os.environ.get("GITMIND_MAX_PAGES", "2")
+
+    return run(
+        repo=repo,
+        branch=branch,
+        channel=channel,
+        project=project,
+        adr_path=adr_path,
+        max_pages=max_pages,
     )
-    tree_resp.raise_for_status()
-    data = tree_resp.json()
-    return [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
 
 
-def get_file_content(
-    owner: str,
-    repo: str,
-    path: str,
-    ref: str | None = None,
-    token: str | None = None,
-) -> tuple[bytes, str]:
-    import base64
-    params = {"ref": ref} if ref else {}
-    resp = _get(f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}", token, params=params, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    content = base64.b64decode(data.get("content", ""))
-    return content, data.get("type", "file")
+if __name__ == "__main__":
+    sys.exit(main())
