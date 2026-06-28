@@ -37,6 +37,7 @@ ENVIRONMENT VARIABLES
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -296,9 +297,97 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
 # Step 3: Tickets
 # ---------------------------------------------------------------------------
 
-def ingest_tickets(driver, project: str | None = None, max_results: int = 5000) -> None:
+def _fetch_repo_local_tickets(repo: str, path: str = "jira/issues.json") -> dict | None:
+    """See snowflake_etl._fetch_repo_local_tickets — identical detection logic,
+    kept duplicated rather than shared to avoid a cross-module import between
+    the two independent ETL CLIs.
+    """
+    import requests
+
+    token = os.getenv("GITHUB_TOKEN")
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    owner, repo_name = repo.split("/", 1)
+    resp = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/contents/{path}",
+        headers=headers, timeout=15,
+    )
+    if not resp.ok:
+        return None
+    try:
+        raw = base64.b64decode(resp.json().get("content", "")).decode("utf-8", errors="replace")
+        data = json.loads(raw)
+    except Exception as exc:
+        log.warning("Found %s in %s but couldn't parse it as JSON: %s", path, repo, exc)
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("issues"), list):
+        log.warning("%s in %s doesn't match expected {project, issues:[...]} shape — ignoring.", path, repo)
+        return None
+    return data
+
+
+def ingest_tickets(
+    driver,
+    repo: str | None = None,
+    project: str | None = None,
+    max_results: int = 5000,
+    local_tickets_path: str = "jira/issues.json",
+) -> None:
     import requests
     from requests.auth import HTTPBasicAuth
+
+    if repo:
+        local = _fetch_repo_local_tickets(repo, local_tickets_path)
+        if local is not None:
+            local_project = (local.get("project") or {}).get("key") or project or repo
+            log.info("Found local ticket file '%s' in %s (project=%s) — using it instead of live Jira.",
+                      local_tickets_path, repo, local_project)
+            with driver.session(database=_db(driver)) as session:
+                for issue in local["issues"]:
+                    key = issue.get("id")
+                    if not key:
+                        continue
+                    issue_type = issue.get("type", "")
+                    is_bug = issue_type.lower() in ("bug", "incident", "defect")
+
+                    _merge_node(session, "Ticket", key, {
+                        "project": local_project,
+                        "summary": str(issue.get("title", ""))[:1000],
+                        "text": str(issue.get("description", ""))[:4000],
+                        "status": issue.get("status", ""),
+                        "priority": issue.get("priority", ""),
+                        "issue_type": issue_type,
+                        "assignee": "",
+                        "created_at": "",
+                        "url": f"https://github.com/{repo}/blob/HEAD/{local_tickets_path}#{key}",
+                        "is_bug": is_bug,
+                    })
+
+                    if is_bug:
+                        _merge_node(session, "BugReport", f"bug:{key}", {
+                            "ticket_ref": key,
+                            "title": str(issue.get("title", ""))[:500],
+                            "summary": str(issue.get("description", ""))[:2000],
+                            "severity": issue.get("priority", ""),
+                            "status": issue.get("status", ""),
+                            "reported_at": "",
+                        })
+                        _merge_rel(session, f"bug:{key}", "BugReport", "REFERENCES", key, "Ticket")
+
+                    # The local ticket file states exactly which commit SHAs
+                    # belong to this issue. That's a direct, reliable signal —
+                    # use it instead of relying on build_edges()'s regex match
+                    # against commit messages, which silently produces zero
+                    # edges for any repo whose commit messages don't happen to
+                    # contain the ticket key as a literal substring (true for
+                    # most repos that don't follow Conventional Commits-style
+                    # "PROJ-123: ..." prefixes).
+                    for sha in issue.get("commits", []) or []:
+                        _merge_rel(session, sha, "Commit", "REFERENCES", key, "Ticket")
+            log.info("ETL done.")
+            return
 
     jira_url   = os.getenv("JIRA_URL", "").rstrip("/")
     jira_user  = os.getenv("JIRA_USER", "")
@@ -723,7 +812,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             ingest_commits(driver, args.repo, branch=args.branch, max_pages=args.max_pages)
         if step in ("all", "tickets"):
-            ingest_tickets(driver, project=args.project)
+            ingest_tickets(driver, repo=args.repo or None, project=args.project)
         if step in ("all", "messages"):
             if not args.channel:
                 log.error("--channel required for messages step")
