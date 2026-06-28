@@ -380,9 +380,123 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
 # Step 3: Tickets (Jira)
 # ---------------------------------------------------------------------------
 
-def ingest_tickets(project: str | None = None, max_results: int = 5000) -> None:
+def _fetch_repo_local_tickets(repo: str, path: str = "jira/issues.json") -> dict | None:
+    """Look for a committed ticket file (e.g. jira/issues.json) in the repo.
+
+    Some repos (anything without a real, externally-hosted Jira instance)
+    track their tickets as a single JSON file checked into the repo itself
+    instead of a live Jira server. This is the generic fallback that makes
+    ticket ingestion work for ANY public repo, not just ones pointed at a
+    real JIRA_URL: if this file exists, use it; otherwise ingest_tickets()
+    falls through unchanged to the live Jira API path below (so Kafka /
+    other repos using a real Jira instance keep working exactly as before).
+
+    Expected shape (minimal):
+        {"project": {"key": "RRW"}, "issues": [{"id": "RRW-001",
+         "type": "Story", "title": "...", "status": "Done",
+         "priority": "High", "commits": ["sha1", "sha2"],
+         "description": "..."}]}
+    Only "id" and "title" are required per issue; everything else is
+    optional and defaults to empty/false if absent.
+    """
+    import requests
+
+    token = os.getenv("GITHUB_TOKEN")
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    owner, repo_name = repo.split("/", 1)
+    resp = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/contents/{path}",
+        headers=headers, timeout=15,
+    )
+    if not resp.ok:
+        return None
+    try:
+        raw = base64.b64decode(resp.json().get("content", "")).decode("utf-8", errors="replace")
+        data = json.loads(raw)
+    except Exception as exc:
+        log.warning("Found %s in %s but couldn't parse it as JSON: %s", path, repo, exc)
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("issues"), list):
+        log.warning("%s in %s doesn't match expected {project, issues:[...]} shape — ignoring.", path, repo)
+        return None
+    return data
+
+
+def ingest_tickets(
+    repo: str | None = None,
+    project: str | None = None,
+    max_results: int = 5000,
+    local_tickets_path: str = "jira/issues.json",
+) -> None:
     import requests
     from requests.auth import HTTPBasicAuth
+
+    # Repo-local ticket file takes priority over the live Jira API — see
+    # _fetch_repo_local_tickets() docstring for why. Falls through to the
+    # unchanged live-API path below if no such file exists for this repo.
+    if repo:
+        local = _fetch_repo_local_tickets(repo, local_tickets_path)
+        if local is not None:
+            local_project = (local.get("project") or {}).get("key") or project or repo
+            log.info("Found local ticket file '%s' in %s (project=%s) — using it instead of live Jira.",
+                      local_tickets_path, repo, local_project)
+            rows = []
+            for issue in local["issues"]:
+                ticket_id = issue.get("id")
+                if not ticket_id:
+                    continue
+                issue_type = issue.get("type", "")
+                rows.append((
+                    ticket_id,
+                    local_project,
+                    str(issue.get("title", ""))[:1000],
+                    str(issue.get("description", ""))[:8000],
+                    issue.get("status", ""),
+                    issue.get("priority", ""),
+                    issue_type,
+                    "",  # assignee — not present in the local-file format
+                    "",  # created_at — not present in the local-file format
+                    # "HEAD" rather than "main" -- this repo's default branch
+                    # might not be main (e.g. ansh-jha2006/reni2's is "license"),
+                    # and GitHub resolves /blob/HEAD/... to whatever the actual
+                    # default branch is, so the link doesn't 404.
+                    f"https://github.com/{repo}/blob/HEAD/{local_tickets_path}#{ticket_id}",
+                    issue_type.lower() in ("bug", "incident", "defect"),
+                ))
+            conn = _get_conn()
+            cur = conn.cursor()
+            try:
+                merge_sql = """
+                MERGE INTO TICKETS AS tgt
+                USING (SELECT %s AS ticket_id, %s AS project, %s AS summary,
+                              %s AS text, %s AS status, %s AS priority,
+                              %s AS issue_type, %s AS assignee, %s AS created_at,
+                              %s AS url, %s AS is_bug) AS src
+                ON tgt.ticket_id = src.ticket_id
+                WHEN MATCHED THEN UPDATE SET
+                    project=src.project, summary=src.summary, text=src.text,
+                    status=src.status, priority=src.priority, issue_type=src.issue_type,
+                    assignee=src.assignee, created_at=src.created_at,
+                    url=src.url, is_bug=src.is_bug
+                WHEN NOT MATCHED THEN INSERT
+                    (ticket_id, project, summary, text, status, priority,
+                     issue_type, assignee, created_at, url, is_bug)
+                VALUES
+                    (src.ticket_id, src.project, src.summary, src.text,
+                     src.status, src.priority, src.issue_type, src.assignee,
+                     src.created_at, src.url, src.is_bug)
+                """
+                for row in rows:
+                    cur.execute(merge_sql, row)
+                log.info("  Upserted %d tickets (from local file).", len(rows))
+            finally:
+                cur.close()
+                conn.close()
+            log.info("ETL done.")
+            return
 
     jira_url = os.getenv("JIRA_URL", "").rstrip("/")
     jira_user = os.getenv("JIRA_USER", "")
@@ -736,8 +850,9 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("commits step failed: %s", exc)
 
     if step in ("all", "tickets"):
+        repo = args.repo or os.getenv("GITHUB_DEFAULT_REPOS", "")
         try:
-            ingest_tickets(project=args.project)
+            ingest_tickets(repo=repo or None, project=args.project)
         except Exception as exc:
             log.error("tickets step failed: %s", exc)
 
