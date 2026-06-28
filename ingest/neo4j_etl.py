@@ -209,13 +209,24 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
     owner, repo_name = repo.split("/", 1)
 
     pinned = os.getenv("GITMIND_INGEST_BRANCH", "")
+    branches = _list_branches(owner, repo_name, headers)
+    if not branches:
+        branches = [branch]
     if pinned:
-        branches = [pinned]
-        log.info("Branch pinned to '%s' via GITMIND_INGEST_BRANCH", pinned)
-    else:
-        branches = _list_branches(owner, repo_name, headers)
-        if not branches:
-            branches = [branch]
+        if pinned in branches:
+            branches = [pinned]
+            log.info("Branch pinned to '%s' via GITMIND_INGEST_BRANCH", pinned)
+        else:
+            # See ingest/snowflake_etl.py's ingest_commits for why this is
+            # validated rather than trusted outright: a deployment-wide pin
+            # left over from a previous repo would otherwise 404 every
+            # commits/adrs call for any repo that doesn't happen to share
+            # that branch name.
+            log.warning(
+                "GITMIND_INGEST_BRANCH='%s' does not exist on %s -- ignoring "
+                "the pin and using all %d branch(es) found instead.",
+                pinned, repo, len(branches),
+            )
 
     log.info("Fetching commits from %s across %d branch(es) (max %d pages / %d commits per branch)...",
               repo, len(branches), max_pages, max_pages * 100)
