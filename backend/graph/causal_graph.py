@@ -29,6 +29,7 @@ GOVERNED_BY) are a hint at the schema this project was designed around.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 log = logging.getLogger("gitmind.graph")
@@ -56,22 +57,35 @@ class Neo4jCausalGraph:
         entity_id: str = "",
         function_name: str = "",
         ticket_id: str = "",
+        max_depth: int | None = None,
     ) -> list[GraphPathNode]:
         """Traverse the causal graph from the given starting identifier.
 
         Walks outward (both directions -- ancestors AND descendants, so
         sibling branches that diverged from a shared commit are reachable
-        too) along a generic set of causal relationship types, with NO
-        depth cap -- the entire connected component (full commit DAG, every
-        branch) is returned in one pass.
+        too) along a generic set of causal relationship types, bounded to
+        `max_depth` hops (env GITMIND_TRACE_MAX_DEPTH, default 4).
+
+        The previous version had no depth cap at all, which meant it
+        returned the entire connected component -- the full commit DAG,
+        every branch, every ticket transitively linked to any of them --
+        instead of a focused causal chain. On a populated graph (e.g. once
+        a repo's commits + tickets are actually wired together with real
+        edges) that one-hop-too-far query balloons into hundreds of nodes
+        with no relation to "what caused this." Capping the hop count keeps
+        the result centered on the starting node instead.
         """
         match_clause, params = self._build_match(entity_id, function_name, ticket_id)
         if match_clause is None:
             return []
 
+        if max_depth is None:
+            max_depth = int(os.getenv("GITMIND_TRACE_MAX_DEPTH", "4"))
+        max_depth = max(1, max_depth)  # *0..N / negative ranges are meaningless here
+
         cypher = f"""
         MATCH (start {match_clause})
-        OPTIONAL MATCH path = (start)-[:CAUSED_BY|INFLUENCED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY*]-(node)
+        OPTIONAL MATCH path = (start)-[:CAUSED_BY|INFLUENCED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY*1..{max_depth}]-(node)
         WITH start, COLLECT(DISTINCT node) AS chain_nodes
         RETURN start, chain_nodes
         """
