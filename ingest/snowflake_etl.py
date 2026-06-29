@@ -757,7 +757,7 @@ def ingest_adrs(repo: str, adr_path: str = "docs/adr") -> None:
         decision = _extract_section(raw, r"## Decision\s+([\s\S]+?)(?=##|$)")
         consequences = _extract_section(raw, r"## Consequences\s+([\s\S]+?)(?=##|$)")
         date_match = re.search(r"(\d{4}-\d{2}-\d{2})", f["name"])
-        created_date = date_match.group(1) if date_match else ""
+        created_date = date_match.group(1) if date_match else None
 
         adr_id = f"{repo}/{f['path']}"
         rows.append((
