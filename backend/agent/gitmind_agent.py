@@ -185,12 +185,27 @@ _FUNCTION_RE = re.compile(
     r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\b",
     re.IGNORECASE,
 )
+# See backend/main.py's enrich_identifiers for why this has to run BEFORE
+# _TICKET_RE: "ADR-001" matches the ticket-key shape too, and ADR node ids
+# are namespaced (f"{repo}/{file_path}") rather than the bare "ADR-001" a
+# query would contain, so misclassifying it as a ticket_id sends an exact
+# Cypher match against a string that can never equal the real node id.
+_ADR_RE = re.compile(r"\bADR[-\s]?(\d{1,4})\b", re.IGNORECASE)
 
 
 def _extract_identifiers(
-    query: str, entity_id: str = "", function_name: str = "", ticket_id: str = ""
-) -> tuple[str, str, str]:
-    if not ticket_id:
+    query: str,
+    entity_id: str = "",
+    function_name: str = "",
+    ticket_id: str = "",
+    adr_ref: str = "",
+) -> tuple[str, str, str, str]:
+    if not adr_ref:
+        m = _ADR_RE.search(query)
+        if m:
+            adr_ref = m.group(1)
+
+    if not ticket_id and not adr_ref:
         m = _TICKET_RE.search(query)
         if m:
             ticket_id = m.group(0)
@@ -201,7 +216,7 @@ def _extract_identifiers(
             # to the raw Jira key itself — that's also what entity_id needs
             # to be for the `{id: $entity_id}` Cypher match to hit.
             entity_id = ticket_id
-        else:
+        elif not adr_ref:
             m = _COMMIT_RE.search(query)
             if m:
                 entity_id = m.group(0)
@@ -211,7 +226,7 @@ def _extract_identifiers(
         if m:
             function_name = m.group(1)
 
-    return entity_id, function_name, ticket_id
+    return entity_id, function_name, ticket_id, adr_ref
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +337,7 @@ def debug(
     entity_id: str = "",
     function_name: str = "",
     ticket_id: str = "",
+    adr_ref: str = "",
 ) -> dict[str, Any]:
     """Run the causal-debugging agent for a natural-language query.
 
@@ -351,18 +367,19 @@ def debug(
             "causal_chain": [],
         }
 
-    entity_id, function_name, ticket_id = _extract_identifiers(
-        query, entity_id, function_name, ticket_id
+    entity_id, function_name, ticket_id, adr_ref = _extract_identifiers(
+        query, entity_id, function_name, ticket_id, adr_ref
     )
 
     chain: list[GraphPathNode] = []
-    if rt.neo4j_driver is not None and (entity_id or function_name or ticket_id):
+    if rt.neo4j_driver is not None and (entity_id or function_name or ticket_id or adr_ref):
         try:
             graph = Neo4jCausalGraph(rt.neo4j_driver, database=rt.neo4j_database)
             chain = graph.trace(
                 entity_id=entity_id,
                 function_name=function_name,
                 ticket_id=ticket_id,
+                adr_ref=adr_ref,
             )
         except Exception as exc:  # noqa: BLE001 - fall through to LLM-only answer
             log.warning("Neo4j trace failed inside agent: %s", exc)
