@@ -72,6 +72,137 @@ def _exe(cur, sql: str, params=None):
 
 
 # ---------------------------------------------------------------------------
+# Schema drift check — code's DDL/MERGE statements assume these columns
+# exist with a roughly-compatible type. CREATE TABLE IF NOT EXISTS silently
+# no-ops on tables that already exist (wrong type, missing column, both),
+# so this is the only thing that surfaces drift before a DML statement
+# crashes mid-ingest. "TEXT"-expected columns that are actually TIMESTAMP_*
+# are the dangerous case: an empty string sent to them blows up with
+# "Timestamp '' is not recognized" (see ADR_RECORDS.created_date, fixed by
+# sending NULL instead of "" — but any other TEXT-expected/TIMESTAMP-actual
+# column has the same landmine if its ingest path ever sends "").
+# ---------------------------------------------------------------------------
+
+EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
+    "COMMITS": {
+        "COMMIT_ID": "TEXT", "REPO": "TEXT", "BRANCH": "TEXT", "AUTHOR": "TEXT",
+        "AUTHOR_EMAIL": "TEXT", "MESSAGE": "TEXT", "TIMESTAMP": "TEXT",
+        "FILES_CHANGED": "NUMBER", "ADDITIONS": "NUMBER", "DELETIONS": "NUMBER",
+        "PATCH_SUMMARY": "TEXT", "URL": "TEXT",
+    },
+    "TICKETS": {
+        "TICKET_ID": "TEXT", "PROJECT": "TEXT", "SUMMARY": "TEXT", "TEXT": "TEXT",
+        "STATUS": "TEXT", "PRIORITY": "TEXT", "ISSUE_TYPE": "TEXT", "ASSIGNEE": "TEXT",
+        "CREATED_AT": "TEXT", "URL": "TEXT", "IS_BUG": "BOOLEAN",
+    },
+    "MESSAGES": {
+        "MESSAGE_ID": "TEXT", "CHANNEL_ID": "TEXT", "CHANNEL_NAME": "TEXT",
+        "USER_ID": "TEXT", "USERNAME": "TEXT", "TEXT": "TEXT", "SUMMARY": "TEXT",
+        "TIMESTAMP": "TEXT", "THREAD_TS": "TEXT",
+    },
+    "ADR_RECORDS": {
+        "ADR_ID": "TEXT", "REPO": "TEXT", "FILE_PATH": "TEXT", "TITLE": "TEXT",
+        "SUMMARY": "TEXT", "STATUS": "TEXT", "CONTEXT": "TEXT", "DECISION": "TEXT",
+        "CONSEQUENCES": "TEXT", "RAW_MARKDOWN": "TEXT", "CREATED_DATE": "TEXT",
+    },
+    "BUG_REPORTS": {
+        "BUG_ID": "TEXT", "TITLE": "TEXT", "SUMMARY": "TEXT", "SEVERITY": "TEXT",
+        "SOURCE": "TEXT", "STATUS": "TEXT", "AFFECTED_REPO": "TEXT",
+        "COMMIT_REF": "TEXT", "TICKET_REF": "TEXT", "REPORTED_AT": "TEXT",
+        "RESOLVED_AT": "TEXT",
+    },
+    "DECISIONS": {
+        "DECISION_ID": "TEXT", "TITLE": "TEXT", "SUMMARY": "TEXT", "RATIONALE": "TEXT",
+        "OUTCOME": "TEXT", "SOURCE": "TEXT", "OWNER": "TEXT", "RELATED_TICKET": "TEXT",
+        "RELATED_COMMIT": "TEXT", "TIMESTAMP": "TEXT",
+    },
+}
+
+_TIMESTAMP_TYPES = ("TIMESTAMP", "DATE", "TIME")
+_TEXT_TYPES = ("TEXT", "VARCHAR", "CHAR", "STRING")
+_NUMBER_TYPES = ("NUMBER", "INT", "FLOAT", "DECIMAL")
+
+
+def _type_category(data_type: str) -> str:
+    dt = data_type.upper()
+    if dt.startswith(_TIMESTAMP_TYPES):
+        return "TIMESTAMP"
+    if dt.startswith(_TEXT_TYPES):
+        return "TEXT"
+    if dt.startswith(_NUMBER_TYPES):
+        return "NUMBER"
+    if dt.startswith("BOOLEAN"):
+        return "BOOLEAN"
+    return dt
+
+
+def validate_schema(execute_fn) -> list[str]:
+    """Compare live Snowflake schema against what the code expects.
+
+    `execute_fn(sql) -> list[dict]` — pass `SnowflakeClient.execute`
+    (server startup path) or a thin wrapper around a cursor (CLI path).
+    Returns a list of human-readable drift warnings; also logs each one
+    so it shows up in render/server logs at boot, before any ingest step
+    runs into it as a runtime crash.
+    """
+    warnings: list[str] = []
+    tables = list(EXPECTED_COLUMNS.keys())
+    try:
+        rows = execute_fn(
+            "SELECT table_name, column_name, data_type FROM information_schema.columns "
+            f"WHERE table_name IN ({', '.join(['%s'] * len(tables))})",
+            tuple(tables),
+        )
+    except TypeError:
+        # execute_fn doesn't take params (e.g. a raw cursor wrapper) — inline instead.
+        in_clause = ", ".join(f"'{t}'" for t in tables)
+        rows = execute_fn(
+            f"SELECT table_name, column_name, data_type FROM information_schema.columns "
+            f"WHERE table_name IN ({in_clause})"
+        )
+
+    live: dict[str, dict[str, str]] = {}
+    for r in rows:
+        t = r["TABLE_NAME"].upper()
+        c = r["COLUMN_NAME"].upper()
+        live.setdefault(t, {})[c] = r["DATA_TYPE"].upper()
+
+    for table, expected_cols in EXPECTED_COLUMNS.items():
+        live_cols = live.get(table)
+        if live_cols is None:
+            warnings.append(f"{table}: table not found in Snowflake (not yet created?).")
+            continue
+        for col, expected_kind in expected_cols.items():
+            actual_type = live_cols.get(col)
+            if actual_type is None:
+                warnings.append(
+                    f"{table}.{col}: column missing from live schema — "
+                    f"code's MERGE/INSERT will fail with 'invalid identifier {col}'."
+                )
+                continue
+            actual_kind = _type_category(actual_type)
+            if expected_kind == "TEXT" and actual_kind == "TIMESTAMP":
+                warnings.append(
+                    f"{table}.{col}: live column is {actual_type} but code treats it as text — "
+                    f"an empty-string insert will fail with \"Timestamp '' is not recognized\"."
+                )
+            elif expected_kind != actual_kind and not (expected_kind == "TEXT" and actual_kind in ("TEXT",)):
+                warnings.append(
+                    f"{table}.{col}: live type {actual_type} ({actual_kind}) "
+                    f"differs from code's expected {expected_kind}."
+                )
+
+    if warnings:
+        log.warning("Schema drift detected (%d issue(s)) — see below:", len(warnings))
+        for w in warnings:
+            log.warning("  - %s", w)
+    else:
+        log.info("Schema check: live Snowflake schema matches code expectations for all 6 tables.")
+
+    return warnings
+
+
+# ---------------------------------------------------------------------------
 # Step 1: DDL — create tables
 # ---------------------------------------------------------------------------
 
@@ -188,6 +319,13 @@ def run_ddl(conn) -> None:
         for stmt in _MIGRATIONS:
             cur.execute(stmt)
         log.info("DDL complete — 6 tables ready.")
+
+        def _exec_dict(sql: str) -> list[dict]:
+            cur.execute(sql)
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        validate_schema(_exec_dict)
     finally:
         cur.close()
         conn.close()
