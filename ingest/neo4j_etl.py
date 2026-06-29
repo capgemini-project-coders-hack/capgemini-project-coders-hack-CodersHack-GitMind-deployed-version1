@@ -384,8 +384,29 @@ def ingest_tickets(
                     # contain the ticket key as a literal substring (true for
                     # most repos that don't follow Conventional Commits-style
                     # "PROJ-123: ..." prefixes).
+                    # jira/issues.json stores 7-char short shas (GitHub's
+                    # display convention), but ingest_commits() MERGEs
+                    # Commit nodes with the full 40-char sha as `id`. A
+                    # plain _merge_rel({id: $sha}) MATCH therefore finds
+                    # zero rows and Cypher silently skips the downstream
+                    # MERGE -- no error, no log, the edge just never
+                    # exists. STARTS WITH matches the short sha as a
+                    # prefix of the real id instead.
+                    ticket_commit_edges = 0
                     for sha in issue.get("commits", []) or []:
-                        _merge_rel(session, sha, "Commit", "REFERENCES", key, "Ticket")
+                        result = session.run(
+                            """
+                            MATCH (a:Commit) WHERE a.id STARTS WITH $sha
+                            MATCH (b:Ticket {id: $key})
+                            MERGE (a)-[r:REFERENCES]->(b)
+                            RETURN count(r) AS merged
+                            """,
+                            sha=sha, key=key,
+                        )
+                        ticket_commit_edges += result.single()["merged"]
+                    if ticket_commit_edges:
+                        log.info("  Ticket %s -[REFERENCES]<- %d Commit(s) linked via jira/issues.json commits[].",
+                                  key, ticket_commit_edges)
             log.info("ETL done.")
             return
 
@@ -870,4 +891,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
