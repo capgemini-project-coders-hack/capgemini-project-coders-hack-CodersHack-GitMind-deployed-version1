@@ -169,6 +169,14 @@ CREATE TABLE IF NOT EXISTS DECISIONS (
 ALL_TABLES = ["COMMITS", "TICKETS", "MESSAGES", "ADR_RECORDS", "BUG_REPORTS", "DECISIONS"]
 
 
+_MIGRATIONS = [
+    # CREATE TABLE IF NOT EXISTS is a no-op on tables that already exist,
+    # so columns added later (e.g. ADR_RECORDS.summary) never reach
+    # pre-existing deployments. Patch them in explicitly here.
+    "ALTER TABLE ADR_RECORDS ADD COLUMN IF NOT EXISTS summary VARCHAR(2000)",
+]
+
+
 def run_ddl(conn) -> None:
     log.info("Creating tables (IF NOT EXISTS)...")
     cur = conn.cursor()
@@ -177,6 +185,8 @@ def run_ddl(conn) -> None:
             stmt = stmt.strip()
             if stmt:
                 cur.execute(stmt)
+        for stmt in _MIGRATIONS:
+            cur.execute(stmt)
         log.info("DDL complete — 6 tables ready.")
     finally:
         cur.close()
