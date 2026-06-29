@@ -646,7 +646,21 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
     intent = classify_intent(payload.query)
     enriched = enrich_identifiers(payload)
 
-    if intent == QueryIntent.causal:
+    # A query that names a specific node (ADR-001, RRW-011, a commit sha, a
+    # function name) is an explicit signal to run the graph trace, even if
+    # classify_intent()'s keyword heuristic guessed "factual" because the
+    # sentence didn't contain "why"/"how"/"caused" etc. (e.g. "What is
+    # ADR-001 about?" has no causal keyword but clearly wants that ADR's
+    # place in the graph, not a blind table dump). Without this, any named
+    # entity falls through to the Snowflake-only factual branch below,
+    # which never calls graph.trace() and always returns an empty
+    # causal_chain -- which is why ADR/ticket/commit nodes never appeared
+    # in the frontend's graph view for anything but "why"-phrased queries.
+    has_named_entity = bool(
+        enriched.entity_id or enriched.function_name or enriched.ticket_id or enriched.adr_ref
+    )
+
+    if intent == QueryIntent.causal or has_named_entity:
         if not (enriched.entity_id or enriched.function_name or enriched.ticket_id or enriched.adr_ref):
             raise HTTPException(
                 status_code=422,
