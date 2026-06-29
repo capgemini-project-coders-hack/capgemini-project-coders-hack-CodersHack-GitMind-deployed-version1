@@ -95,7 +95,7 @@ def reset_all(driver=None) -> None:
     try:
         with driver.session(database=_db(driver)) as session:
             try:
-                session.run("""
+                result = session.run("""
                     MATCH (n)
                     CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 1000 ROWS
                 """)
@@ -688,56 +688,61 @@ def build_edges(driver) -> None:
     with driver.session(database=_db(driver)) as session:
 
         # Commit message references a Jira ticket  → Commit -[REFERENCES]-> Ticket
-        session.run("""
+        result = session.run("""
             MATCH (c:Commit), (t:Ticket)
             WHERE c.message =~ ('(?i).*' + t.id + '.*')
               AND NOT (c)-[:REFERENCES]->(t)
             MERGE (c)-[:REFERENCES]->(t)
         """)
-        log.info("  Commit -[REFERENCES]-> Ticket: done")
+        merged = result.consume().counters.relationships_created
+        log.info("  Commit -[REFERENCES]-> Ticket: %d edge(s) created", merged)
 
         # BugReport references a commit  → BugReport -[CAUSED_BY]-> Commit
-        session.run("""
+        result = session.run("""
             MATCH (b:BugReport), (c:Commit)
             WHERE b.commit_ref = c.id
               AND b.commit_ref <> ''
               AND NOT (b)-[:CAUSED_BY]->(c)
             MERGE (b)-[:CAUSED_BY]->(c)
         """)
-        log.info("  BugReport -[CAUSED_BY]-> Commit: done")
+        merged = result.consume().counters.relationships_created
+        log.info("  BugReport -[CAUSED_BY]-> Commit: %d edge(s) created", merged)
 
         # BugReport references a Ticket  → already created inline; ensure symmetric link
-        session.run("""
+        result = session.run("""
             MATCH (b:BugReport), (t:Ticket)
             WHERE b.ticket_ref = t.id
               AND b.ticket_ref <> ''
               AND NOT (b)-[:REFERENCES]->(t)
             MERGE (b)-[:REFERENCES]->(t)
         """)
-        log.info("  BugReport -[REFERENCES]-> Ticket: done")
+        merged = result.consume().counters.relationships_created
+        log.info("  BugReport -[REFERENCES]-> Ticket: %d edge(s) created", merged)
 
         # Decision governs a Ticket  → Decision -[GOVERNED_BY]-> Ticket
-        session.run("""
+        result = session.run("""
             MATCH (d:Decision), (t:Ticket)
             WHERE d.related_ticket = t.id
               AND d.related_ticket <> ''
               AND NOT (d)-[:GOVERNED_BY]->(t)
             MERGE (d)-[:GOVERNED_BY]->(t)
         """)
-        log.info("  Decision -[GOVERNED_BY]-> Ticket: done")
+        merged = result.consume().counters.relationships_created
+        log.info("  Decision -[GOVERNED_BY]-> Ticket: %d edge(s) created", merged)
 
         # Decision shaped a Commit  → Decision -[SHAPES]-> Commit
-        session.run("""
+        result = session.run("""
             MATCH (d:Decision), (c:Commit)
             WHERE d.related_commit = c.id
               AND d.related_commit <> ''
               AND NOT (d)-[:SHAPES]->(c)
             MERGE (d)-[:SHAPES]->(c)
         """)
-        log.info("  Decision -[SHAPES]-> Commit: done")
+        merged = result.consume().counters.relationships_created
+        log.info("  Decision -[SHAPES]-> Commit: %d edge(s) created", merged)
 
         # ADR governs Decisions (link by project/title keyword overlap — best effort)
-        session.run("""
+        result = session.run("""
             MATCH (a:ADR), (d:Decision)
             WHERE a.repo IS NOT NULL
               AND d.title IS NOT NULL
@@ -745,25 +750,46 @@ def build_edges(driver) -> None:
               AND NOT (a)-[:GOVERNED_BY]->(d)
             MERGE (a)-[:GOVERNED_BY]->(d)
         """)
-        log.info("  ADR -[GOVERNED_BY]-> Decision: done (keyword match)")
+        merged = result.consume().counters.relationships_created
+        log.info("  ADR -[GOVERNED_BY]-> Decision: %d edge(s) created (keyword match)", merged)
+
+        # ADR -[GOVERNED_BY]-> Decision above only ever fires if Decision nodes
+        # exist, and Decision nodes only come from ingest_decisions_from_file(),
+        # which run_ingest.py's automatic pipeline never calls (it's a manual,
+        # --input-file-only step). So for every repo ingested through
+        # /ingest/repo, that edge is permanently zero rows and ADR nodes are
+        # disconnected islands. Give ADR a second, automatic path into the
+        # graph: link it to commits in the same repo whose message mentions
+        # the ADR's title (same best-effort keyword approach as above).
+        result = session.run("""
+            MATCH (a:ADR), (c:Commit)
+            WHERE a.repo = c.repo
+              AND toLower(c.message) CONTAINS toLower(split(a.title, ':')[0])
+              AND NOT (a)-[:REFERENCES]->(c)
+            MERGE (a)-[:REFERENCES]->(c)
+        """)
+        merged = result.consume().counters.relationships_created
+        log.info("  ADR -[REFERENCES]-> Commit: %d edge(s) created (keyword match)", merged)
 
         # SlackMessage discusses a Ticket  → SlackMessage -[DISCUSSED_IN]-> Ticket
-        session.run("""
+        result = session.run("""
             MATCH (m:SlackMessage), (t:Ticket)
             WHERE m.text =~ ('(?i).*' + t.id + '.*')
               AND NOT (m)-[:DISCUSSED_IN]->(t)
             MERGE (m)-[:DISCUSSED_IN]->(t)
         """)
-        log.info("  SlackMessage -[DISCUSSED_IN]-> Ticket: done")
+        merged = result.consume().counters.relationships_created
+        log.info("  SlackMessage -[DISCUSSED_IN]-> Ticket: %d edge(s) created", merged)
 
         # SlackMessage discusses a Commit (SHA mention)
-        session.run("""
+        result = session.run("""
             MATCH (m:SlackMessage), (c:Commit)
             WHERE m.text =~ ('(?i).*' + left(c.id, 7) + '.*')
               AND NOT (m)-[:DISCUSSED_IN]->(c)
             MERGE (m)-[:DISCUSSED_IN]->(c)
         """)
-        log.info("  SlackMessage -[DISCUSSED_IN]-> Commit: done")
+        merged = result.consume().counters.relationships_created
+        log.info("  SlackMessage -[DISCUSSED_IN]-> Commit: %d edge(s) created", merged)
 
     log.info("Edge building complete.")
 
@@ -844,3 +870,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
