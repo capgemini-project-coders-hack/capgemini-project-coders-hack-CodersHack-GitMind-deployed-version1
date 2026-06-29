@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 log = logging.getLogger("gitmind.graph")
@@ -57,6 +58,7 @@ class Neo4jCausalGraph:
         entity_id: str = "",
         function_name: str = "",
         ticket_id: str = "",
+        adr_ref: str = "",
         max_depth: int | None = None,
     ) -> list[GraphPathNode]:
         """Traverse the causal graph from the given starting identifier.
@@ -75,7 +77,9 @@ class Neo4jCausalGraph:
         with no relation to "what caused this." Capping the hop count keeps
         the result centered on the starting node instead.
         """
-        match_clause, params = self._build_match(entity_id, function_name, ticket_id)
+        match_clause, where_clause, params = self._build_match(
+            entity_id, function_name, ticket_id, adr_ref
+        )
         if match_clause is None:
             return []
 
@@ -83,8 +87,12 @@ class Neo4jCausalGraph:
             max_depth = int(os.getenv("GITMIND_TRACE_MAX_DEPTH", "4"))
         max_depth = max(1, max_depth)  # *0..N / negative ranges are meaningless here
 
+        start_pattern = f"(start {match_clause})" if match_clause else "(start)"
+        where_sql = f"WHERE {where_clause}" if where_clause else ""
+
         cypher = f"""
-        MATCH (start {match_clause})
+        MATCH {start_pattern}
+        {where_sql}
         OPTIONAL MATCH path = (start)-[:CAUSED_BY|INFLUENCED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY*1..{max_depth}]-(node)
         WITH start, COLLECT(DISTINCT node) AS chain_nodes
         RETURN start, chain_nodes
@@ -130,15 +138,33 @@ class Neo4jCausalGraph:
             return chain
 
     @staticmethod
-    def _build_match(entity_id: str, function_name: str, ticket_id: str):
+    def _build_match(entity_id: str, function_name: str, ticket_id: str, adr_ref: str = ""):
         if entity_id:
-            return "{id: $entity_id}", {"entity_id": entity_id}
+            return "{id: $entity_id}", "", {"entity_id": entity_id}
         if function_name:
-            return "{name: $function_name}", {"function_name": function_name}
+            return "{name: $function_name}", "", {"function_name": function_name}
+        if adr_ref:
+            # ADR nodes are MERGEd (ingest/neo4j_etl.py: ingest_adrs) with
+            # `id` set to f"{repo}/{file_path}" -- e.g.
+            # "owner/repo/docs/adr/ADR-001-neo4j.md" -- not just "ADR-001".
+            # A query referencing "ADR-001" or "ADR 1" can never know that
+            # full namespaced id ahead of time, so this can't be an exact
+            # {id: $adr_ref} match like the cases above -- it needs a
+            # substring/regex match against whatever numeric ADR reference
+            # the query contained. `0*` absorbs however the source file
+            # happens to zero-pad its number (001, 01, 1, ...) regardless
+            # of how many digits the user typed, and (?!\\d) stops "ADR-1"
+            # from also matching "ADR-12".
+            try:
+                number = str(int(adr_ref))
+            except ValueError:
+                number = re.sub(r"\D", "", adr_ref) or adr_ref
+            pattern = rf"(?i).*ADR-0*{number}(?!\d).*"
+            return "", "start:ADR AND start.id =~ $adr_pattern", {"adr_pattern": pattern}
         if ticket_id:
             # Ticket nodes are MERGEd (see ingest/neo4j_etl.py) with `id` set
             # to the raw Jira key — there is no separate `ticket_id`
             # property on any node, so matching on it would always return
             # zero results.
-            return "{id: $ticket_id}", {"ticket_id": ticket_id}
-        return None, {}
+            return "{id: $ticket_id}", "", {"ticket_id": ticket_id}
+        return None, "", {}
