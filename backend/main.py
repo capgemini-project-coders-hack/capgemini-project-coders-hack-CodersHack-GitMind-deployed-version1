@@ -19,6 +19,7 @@ from backend.agent.gitmind_agent import (
     debug as agent_debug,
 )
 from backend.harsh_engine.core.regression_guard import check_chain_for_regressions
+from ingest.snowflake_etl import validate_schema
 import os as _os
 
 log = logging.getLogger("gitmind.api")
@@ -1136,6 +1137,10 @@ def create_app() -> FastAPI:
             try:
                 app.state.snowflake_client = SnowflakeClient(snowflake_cfg)
                 app.state.snowflake_details = SnowflakeDetails(app.state.snowflake_client)
+                try:
+                    validate_schema(app.state.snowflake_client.execute)
+                except Exception as exc:  # noqa: BLE001 - check is informational, never block boot
+                    log.warning("Schema drift check failed to run: %s", exc)
             except Exception as exc:
                 log.warning("Snowflake connection failed: %s", exc)
 
