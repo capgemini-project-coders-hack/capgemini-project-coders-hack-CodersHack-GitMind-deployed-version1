@@ -35,6 +35,7 @@ class GitMindQuery(BaseModel):
     entity_id: str = ""
     function_name: str = ""
     ticket_id: str = ""
+    adr_ref: str = ""
     table: str = ""
     limit: int = Field(default=25, ge=1, le=100)
 
@@ -174,11 +175,28 @@ def classify_intent(query: str) -> QueryIntent:
     return QueryIntent.factual
 
 
+# "ADR-001", "ADR 1", "adr-12" — matched BEFORE the ticket regex below,
+# because "ADR-001" also syntactically matches a Jira-ticket-key shape
+# ([A-Z][A-Z0-9]+-\d+). Without this check running first, every ADR
+# reference in a query was being misread as a ticket id, then sent through
+# an exact Cypher {id: $entity_id} match against the literal string
+# "ADR-001" -- which can never hit, since the real Neo4j node id is the
+# full namespaced path ingest_adrs() builds (e.g.
+# "owner/repo/docs/adr/ADR-001-neo4j.md"). That's the root cause of the
+# "ADR trace not found" fallback.
+_ADR_RE = re.compile(r"\bADR[-\s]?(\d{1,4})\b", re.IGNORECASE)
+
+
 def enrich_identifiers(payload: GitMindQuery) -> GitMindQuery:
     data = payload.model_copy()
     text = payload.query
 
-    if not data.ticket_id:
+    if not data.adr_ref:
+        adr = _ADR_RE.search(text)
+        if adr:
+            data.adr_ref = adr.group(1)
+
+    if not data.ticket_id and not data.adr_ref:
         ticket = re.search(r"\b[A-Z][A-Z0-9]+-\d+\b", text)
         if ticket:
             data.ticket_id = ticket.group(0)
@@ -190,7 +208,7 @@ def enrich_identifiers(payload: GitMindQuery) -> GitMindQuery:
         # that exactly or the trace silently returns nothing.
         data.entity_id = data.ticket_id
 
-    if not data.entity_id:
+    if not data.entity_id and not data.adr_ref:
         commit = re.search(r"\b[0-9a-f]{7,40}\b", text, flags=re.IGNORECASE)
         if commit:
             data.entity_id = commit.group(0)
@@ -612,6 +630,7 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
                 entity_id=payload.entity_id,
                 function_name=payload.function_name,
                 ticket_id=payload.ticket_id,
+                adr_ref=payload.adr_ref,
             )
             return GitMindQueryResponse(
                 intent=classify_intent(payload.query),
@@ -627,10 +646,10 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
     enriched = enrich_identifiers(payload)
 
     if intent == QueryIntent.causal:
-        if not (enriched.entity_id or enriched.function_name or enriched.ticket_id):
+        if not (enriched.entity_id or enriched.function_name or enriched.ticket_id or enriched.adr_ref):
             raise HTTPException(
                 status_code=422,
-                detail="Clarify the specific Function name, Ticket ID, or graph node ID before running causal traversal.",
+                detail="Clarify the specific Function name, Ticket ID, ADR reference, or graph node ID before running causal traversal.",
             )
 
         if graph is None:
@@ -651,11 +670,13 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
                 entity_id=enriched.entity_id,
                 function_name=enriched.function_name,
                 ticket_id=enriched.ticket_id,
+                adr_ref=enriched.adr_ref,
             )
             chain = agent_result.get("causal_chain") or graph.trace(
                 entity_id=enriched.entity_id,
                 function_name=enriched.function_name,
                 ticket_id=enriched.ticket_id,
+                adr_ref=enriched.adr_ref,
             )
             evidence = snowflake.fetch_for_chain(chain) if snowflake else []
             answer = agent_result.get("root_cause") or summarize_chain(chain, evidence)
@@ -680,6 +701,7 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
                     entity_id=enriched.entity_id,
                     function_name=enriched.function_name,
                     ticket_id=enriched.ticket_id,
+                    adr_ref=enriched.adr_ref,
                 )
                 evidence = snowflake.fetch_for_chain(chain) if snowflake else []
                 chain_dicts = [node.__dict__ for node in chain]
