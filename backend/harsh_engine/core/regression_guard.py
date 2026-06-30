@@ -60,8 +60,15 @@ def check_chain_for_regressions(
     dict with keys:
         ran : bool             — False if the check was skipped entirely
         safe : bool | None      — None if not run, else True/False
-        violations : list[dict] — one entry per contradicted decision
-        checked_decisions : int — how many Decision/ADR nodes were evaluated
+        violations : list[dict] — one entry per contradicted decision (one
+                                   entry per node_id if multiple nodes —
+                                   e.g. an ADR and its synthesized Decision
+                                   counterpart — share the same text)
+        checked_decisions : int — how many UNIQUE decision texts were
+                                   evaluated (nodes with duplicate summary
+                                   text, such as an ADR/Decision pair from
+                                   the same source, are deduped to one
+                                   LLM call)
         reason : str             — human-readable note (e.g. why skipped)
     """
     decisions = [n for n in causal_chain if n.get("label") in DECISION_LABELS]
@@ -101,10 +108,46 @@ def check_chain_for_regressions(
     model = genai.GenerativeModel(model_name)
     violations: list[dict[str, str]] = []
 
+    # Group by underlying decision identity, not by summary text.
+    #
+    # An ADR and its synthesized Decision counterpart (see
+    # ingest/neo4j_etl.py:synthesize_decisions_from_adrs, which mints a
+    # Decision node with id=f"decision:{adr_id}") describe the SAME
+    # recorded decision and both match DECISION_LABELS -- a chain
+    # containing both was firing two LLM calls per ADR.
+    #
+    # The previous attempt at this grouped by node["summary"] string
+    # equality, which doesn't actually work: ingest_adrs() sets the ADR
+    # node's summary to the ADR title, while synthesize_decisions_from_adrs
+    # sets the Decision node's summary to a slice of the ADR's raw body
+    # text (falling back to title only if the body is empty) -- two
+    # different strings for the same decision in the common case, so the
+    # "dedup" silently never matched and both calls still fired. Group by
+    # the actual id relationship instead: strip the "decision:" prefix off
+    # a synthesized Decision's node_id and it equals its source ADR's
+    # node_id exactly, by construction -- that's the real pairing key.
+    def _dedupe_key(node: dict[str, Any]) -> str:
+        node_id = node.get("node_id", "")
+        if node.get("label") == "Decision" and node_id.startswith("decision:"):
+            return node_id[len("decision:"):]
+        return node_id
+
+    groups: dict[str, list[dict[str, Any]]] = {}
     for node in decisions:
-        decision_text = node.get("summary") or ""
+        groups.setdefault(_dedupe_key(node), []).append(node)
+
+    for key, group_nodes in groups.items():
+        # Prefer the ADR's text over the synthesized Decision's when both
+        # are present in the group -- the ADR carries the original title +
+        # body, the Decision is a derived stub built from it.
+        adr_node = next((n for n in group_nodes if n.get("label") == "ADR"), None)
+        representative = adr_node or group_nodes[0]
+        decision_text = representative.get("summary") or ""
         if not decision_text:
             continue
+
+        node_ids = [n.get("node_id", "") for n in group_nodes]
+
         try:
             response = model.generate_content(
                 VIOLATION_PROMPT.format(
@@ -114,7 +157,7 @@ def check_chain_for_regressions(
             )
             raw = (response.text or "").strip()
         except Exception as exc:  # network/API errors should not break /query
-            logger.warning("Regression check call failed for node %s: %s", node.get("node_id"), exc)
+            logger.warning("Regression check call failed for node(s) %s: %s", node_ids, exc)
             continue
 
         upper = raw.upper()
@@ -123,18 +166,19 @@ def check_chain_for_regressions(
         reason = parts[1].lstrip(",:.- ") if len(parts) > 1 else raw
 
         if violated:
-            violations.append(
-                {
-                    "node_id": node.get("node_id", ""),
-                    "decision_summary": decision_text,
-                    "reason": reason,
-                }
-            )
+            for node_id in node_ids:
+                violations.append(
+                    {
+                        "node_id": node_id,
+                        "decision_summary": decision_text,
+                        "reason": reason,
+                    }
+                )
 
     return {
         "ran": True,
         "safe": len(violations) == 0,
         "violations": violations,
-        "checked_decisions": len(decisions),
+        "checked_decisions": len(groups),
         "reason": "",
     }
