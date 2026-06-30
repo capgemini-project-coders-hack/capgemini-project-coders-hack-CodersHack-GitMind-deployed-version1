@@ -22,8 +22,11 @@ and has been stubbed out so the rest of the codebase imports and runs.
 
 Replace the body of `trace()` with your real Cypher query. The
 relationship types referenced in the regression_guard.py docstring
-(CAUSED_BY | INFLUENCED_BY | REFERENCES | SHAPES | DISCUSSED_IN |
-GOVERNED_BY) are a hint at the schema this project was designed around.
+(CAUSED_BY | REFERENCES | SHAPES | DISCUSSED_IN | GOVERNED_BY) are a
+hint at the schema this project was designed around. (INFLUENCED_BY was
+dropped — no ingest path in ingest/neo4j_etl.py ever creates it, so it
+only ever produced a Neo4j "relationship type does not exist" warning
+and a dead branch in this query.)
 """
 
 from __future__ import annotations
@@ -93,7 +96,7 @@ class Neo4jCausalGraph:
         cypher = f"""
         MATCH {start_pattern}
         {where_sql}
-        OPTIONAL MATCH path = (start)-[:CAUSED_BY|INFLUENCED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY*1..{max_depth}]-(node)
+        OPTIONAL MATCH path = (start)-[:CAUSED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY*1..{max_depth}]-(node)
         WITH start, COLLECT(DISTINCT node) AS chain_nodes
         RETURN start, chain_nodes
         """
