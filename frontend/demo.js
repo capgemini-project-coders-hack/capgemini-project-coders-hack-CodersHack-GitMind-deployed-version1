@@ -138,6 +138,12 @@ def analyze_repository(repo_url):
   const timelineBody = document.getElementById("timelineBody");
   const repoExplorer = document.getElementById("repoExplorer");
 
+  const overviewReportBody = document.getElementById("overviewReportBody");
+  const motivePromptInput = document.getElementById("motivePromptInput");
+  const generateOverviewBtn = document.getElementById("generateOverviewBtn");
+  const overviewReportError = document.getElementById("overviewReportError");
+  const EMPTY_OVERVIEW_HTML = overviewReportBody.innerHTML;
+
   const EMPTY_GRAPH_HTML = graphPanelBody.innerHTML;
 
   function escapeHtml(s) {
@@ -956,6 +962,69 @@ def analyze_repository(repo_url):
       <div style="font-size:13px;font-weight:600;margin-bottom:6px;">Preview: ${escapeHtml(path)}</div>
       <pre class="dm-code" style="border-radius:8px;max-height:400px;overflow:auto;">${escapeHtml(content.slice(0, 20000))}</pre>`;
   }
+
+  // ── Overview Report (Project Overview Report PDF) ──────────────────────
+  function setOverviewError(msg) {
+    if (!msg) {
+      overviewReportError.style.display = "none";
+      overviewReportError.textContent = "";
+      return;
+    }
+    overviewReportError.style.display = "block";
+    overviewReportError.textContent = msg;
+  }
+
+  function renderOverviewReport(reportId, pdfUrl) {
+    const fullUrl = `${BACKEND_URL}${pdfUrl}`;
+    overviewReportBody.innerHTML = `
+      <iframe src="${fullUrl}" style="width:100%;height:320px;border:1px solid #E2E8F0;border-radius:8px;" title="Overview report preview"></iframe>
+      <a href="${fullUrl}" download class="gm-btn-outline gm-btn-full" style="display:block;text-align:center;margin-top:12px;text-decoration:none;">Download PDF</a>`;
+  }
+
+  async function generateOverviewReport() {
+    setOverviewError(null);
+
+    const repo = (state.dm_repo || repoUrlInput.value || "").trim();
+    if (!repo) {
+      setOverviewError("Enter and analyze a repository first.");
+      return;
+    }
+
+    generateOverviewBtn.disabled = true;
+    generateOverviewBtn.textContent = "Generating…";
+    overviewReportBody.innerHTML = `
+      <div class="dm-loading">
+        <div class="dm-spinner"></div>
+        <div class="dm-loading-text">Building overview report…</div>
+      </div>`;
+
+    try {
+      const resp = await postJSON(
+        "/insight/overview",
+        { repo, motive_prompt: (motivePromptInput.value || "").trim() },
+        60000
+      );
+      const data = await resp.json().catch(() => ({}));
+
+      if (resp.status !== 200) {
+        overviewReportBody.innerHTML = EMPTY_OVERVIEW_HTML;
+        setOverviewError(data.detail || `Report generation failed (HTTP ${resp.status}).`);
+        return;
+      }
+
+      renderOverviewReport(data.report_id, data.pdf_url);
+    } catch (err) {
+      overviewReportBody.innerHTML = EMPTY_OVERVIEW_HTML;
+      setOverviewError(`Request failed: ${err && err.message ? err.message : err}`);
+    } finally {
+      generateOverviewBtn.disabled = false;
+      generateOverviewBtn.textContent = "Generate Overview Report";
+    }
+  }
+
+  generateOverviewBtn.addEventListener("click", () => {
+    generateOverviewReport();
+  });
 
   // ── Form submit ──────────────────────────────────────────────────────────
   form.addEventListener("submit", (e) => {
