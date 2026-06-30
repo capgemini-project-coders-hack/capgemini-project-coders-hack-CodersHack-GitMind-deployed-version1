@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import uuid
 from enum import Enum
 from typing import Any
 from datetime import datetime
@@ -81,6 +82,22 @@ class RepoIngestRequest(BaseModel):
     branch: str = Field(default="main")
     jira_project: str = Field(default="", description="Jira project key for this repo, e.g. 'PROJ'. Falls back to JIRA_DEFAULT_PROJECT if omitted.")
     adr_path: str = Field(default="", description="Path to this repo's ADR folder, e.g. 'docs/adr'. Falls back to GITMIND_ADR_PATH (default 'docs/adr') if omitted.")
+
+
+class InsightOverviewRequest(BaseModel):
+    """Body for POST /insight/overview.
+
+    motive_prompt is free text on what the project is supposed to do --
+    optional. When given, the report includes an alignment_note comparing
+    observed activity (tickets/ADRs/commits) against the stated purpose.
+    """
+    repo: str = Field(..., min_length=3, description="owner/repo, or a full GitHub URL")
+    motive_prompt: str = Field(default="", max_length=2000)
+
+
+class InsightOverviewResponse(BaseModel):
+    report_id: str
+    pdf_url: str
 
 
 class SnowflakeDetails:
@@ -616,6 +633,78 @@ def ingest_repo_status() -> dict[str, Any]:
         "current_repo": _repo_ingest_state["current_repo"],
         "last_result": _repo_ingest_state["last_result"],
     }
+
+
+@router.post("/insight/overview", response_model=InsightOverviewResponse)
+def insight_overview(payload: InsightOverviewRequest, request: Request) -> InsightOverviewResponse:
+    """Generate a Project Overview Report PDF: repo stats (already-ingested
+    Snowflake data) + one live GitHub branch lookup + one bounded LLM
+    prompt. Synchronous -- no chunking, no file-content analysis, no
+    BackgroundTasks; this is meant to complete in a few seconds.
+    """
+    from backend.insight_report import (
+        gather_repo_stats, fetch_branch_info, generate_overview, render_pdf, register_report,
+    )
+
+    try:
+        slug = normalize_repo_slug(payload.repo)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    snowflake_client: SnowflakeClient | None = getattr(request.app.state, "snowflake_client", None)
+    if snowflake_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Snowflake is not connected on this backend. Ingest a repo first via /ingest/repo, "
+                   "then retry -- overview stats are read from already-ingested Snowflake data.",
+        )
+
+    try:
+        stats = gather_repo_stats(snowflake_client, slug)
+    except Exception as exc:
+        log.error("Overview stats query failed for %s: %s", slug, exc)
+        raise HTTPException(status_code=503, detail=f"Snowflake is unreachable or the stats query failed: {exc}") from exc
+
+    if stats.commit_count == 0 and stats.ticket_count == 0 and stats.adr_count == 0:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No ingested data found for {slug}. Run POST /ingest/repo for this repo first.",
+        )
+
+    stats.branch_count, stats.branch_names = fetch_branch_info(slug)
+
+    try:
+        llm_result = generate_overview(stats, slug, payload.motive_prompt)
+        pdf_path = render_pdf(slug, stats, llm_result)
+    except Exception as exc:
+        log.error("Overview report generation failed for %s: %s", slug, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate overview report: {exc}") from exc
+
+    report_id = str(uuid.uuid4())
+    register_report(report_id, pdf_path, slug)
+
+    return InsightOverviewResponse(report_id=report_id, pdf_url=f"/insight/overview/{report_id}/download")
+
+
+@router.get("/insight/overview/{report_id}/download")
+def insight_overview_download(report_id: str):
+    from fastapi.responses import FileResponse
+    from backend.insight_report import lookup_report
+
+    entry = lookup_report(report_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found -- it may not exist, or this backend instance restarted since it "
+                   "was generated (PDF storage is ephemeral on Render). Generate a new report.",
+        )
+
+    repo_part = re.sub(r"[^A-Za-z0-9_.-]", "_", entry["repo"])
+    return FileResponse(
+        entry["path"],
+        media_type="application/pdf",
+        filename=f"gitmind_overview_{repo_part}.pdf",
+    )
 
 
 @router.post("/query", response_model=GitMindQueryResponse)
