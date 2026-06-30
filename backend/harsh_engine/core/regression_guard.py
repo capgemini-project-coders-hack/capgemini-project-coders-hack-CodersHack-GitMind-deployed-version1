@@ -5,7 +5,7 @@ regression_guard.py — Zero-regression check wired against the REAL causal grap
 schema (`:CodeFunction`, fixed relationship names) that the rest of this
 codebase does not use — `backend/graph/causal_graph.py` produces a generic
 `GraphPathNode` chain (node_id/label/summary/source_type/source_id) traversed
-over `CAUSED_BY|INFLUENCED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY`
+over `CAUSED_BY|REFERENCES|SHAPES|DISCUSSED_IN|GOVERNED_BY`
 relationships with no `:CodeFunction` label at all. Calling the original
 function against this project's actual Neo4j data would always raise
 ``ValueError: No CodeFunction node found``.
@@ -138,4 +138,3 @@ def check_chain_for_regressions(
         "checked_decisions": len(decisions),
         "reason": "",
     }
-
