@@ -24,3 +24,4 @@ requests>=2.31.0
 
 # Config
 python-dotenv>=1.0.0
+reportlab>=4.0.0
