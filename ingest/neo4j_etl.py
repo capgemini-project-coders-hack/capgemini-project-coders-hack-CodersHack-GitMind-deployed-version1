@@ -41,6 +41,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -648,6 +649,77 @@ def _extract_section(text: str, pattern: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Step 5.5: Synthesize Decision nodes from ADRs — generic, any repo.
+#
+# build_edges() already wires Decision -[GOVERNED_BY]-> Ticket and
+# Decision -[SHAPES]-> Commit, but those queries only fire if Decision
+# nodes exist with related_ticket / related_commit populated. The only
+# path that creates Decision nodes is ingest_decisions_from_file(), which
+# is manual-JSON-only and never called by run_ingest.py's automatic
+# pipeline. Result: every repo ingested through /ingest/repo has zero
+# Decision nodes, so SHAPES/GOVERNED_BY are permanently empty regardless
+# of repo. This derives one Decision per ADR automatically, using the
+# same best-effort regex/keyword matching already used elsewhere in this
+# file (ticket-key shape, ADR-title-in-commit-message) so it generalizes
+# to any public repo without per-repo configuration.
+# ---------------------------------------------------------------------------
+
+_TICKET_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d{1,5}\b")
+
+
+def synthesize_decisions_from_adrs(driver, repo: str) -> None:
+    log.info("Synthesizing Decision nodes from ADRs for %s...", repo)
+
+    inserted = 0
+    with driver.session(database=_db(driver)) as session:
+        adrs = session.run(
+            "MATCH (a:ADR {repo: $repo}) RETURN a.id AS id, a.title AS title, "
+            "a.text AS text, a.status AS status",
+            repo=repo,
+        ).data()
+
+        for adr in adrs:
+            adr_id = adr["id"]
+            title = adr.get("title") or ""
+            text = adr.get("text") or ""
+            decision_id = f"decision:{adr_id}"
+
+            # related_ticket: any ticket-key-shaped token mentioned in the
+            # ADR body — same shape regex used for commit/query ticket
+            # extraction elsewhere in this codebase. Generic, no per-repo
+            # config required.
+            ticket_match = _TICKET_KEY_RE.search(text) or _TICKET_KEY_RE.search(title)
+            related_ticket = ticket_match.group(0) if ticket_match else ""
+
+            # related_commit: the commit whose message references this
+            # ADR's title keyword — same best-effort match build_edges()
+            # already uses for ADR -[REFERENCES]-> Commit, reused here so
+            # the Decision node anchors to the same commit.
+            commit_row = session.run(
+                """
+                MATCH (c:Commit {repo: $repo})
+                WHERE toLower(c.message) CONTAINS toLower(split($title, ':')[0])
+                RETURN c.id AS id ORDER BY c.timestamp ASC LIMIT 1
+                """,
+                repo=repo, title=title,
+            ).single()
+            related_commit = commit_row["id"] if commit_row else ""
+
+            _merge_node(session, "Decision", decision_id, {
+                "title": title[:500],
+                "summary": (text[:500] or title[:500]),
+                "outcome": adr.get("status") or "",
+                "owner": "",
+                "related_ticket": related_ticket,
+                "related_commit": related_commit,
+                "timestamp": "",
+            })
+            inserted += 1
+
+    log.info("  Synthesized %d Decision node(s) from ADRs.", inserted)
+
+
+# ---------------------------------------------------------------------------
 # Step 6: JSON feeds → BugReport / Decision nodes
 # ---------------------------------------------------------------------------
 
@@ -823,7 +895,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="GitMind Neo4j ETL")
     parser.add_argument("--step", default="all",
         choices=["all", "constraints", "commits", "tickets", "messages",
-                 "adrs", "bugs", "decisions", "edges", "reset"])
+                 "adrs", "decisions_synth", "bugs", "decisions", "edges", "reset"])
     parser.add_argument("--repo",     help="owner/repo for commits and ADRs")
     parser.add_argument("--branch",   default="main")
     parser.add_argument("--channel",  help="Slack channel ID")
@@ -870,6 +942,12 @@ def main(argv: list[str] | None = None) -> int:
                 log.error("--repo required for adrs step")
                 return 1
             ingest_adrs(driver, args.repo, adr_path=args.adr_path)
+            synthesize_decisions_from_adrs(driver, args.repo)
+        if step == "decisions_synth":
+            if not args.repo:
+                log.error("--repo required for decisions_synth step")
+                return 1
+            synthesize_decisions_from_adrs(driver, args.repo)
         if step == "bugs":
             if not args.input:
                 log.error("--input required for bugs step")
