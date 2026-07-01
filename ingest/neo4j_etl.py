@@ -98,7 +98,7 @@ def reset_all(driver=None) -> None:
             try:
                 result = session.run("""
                     MATCH (n)
-                    CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 1000 ROWS
+                    CALL (n) { DETACH DELETE n } IN TRANSACTIONS OF 1000 ROWS
                 """)
             except Exception:
                 session.run("MATCH (n) DETACH DELETE n")
@@ -892,21 +892,36 @@ def build_edges(driver) -> None:
     with driver.session(database=_db(driver)) as session:
 
         # Commit message references a Jira ticket  → Commit -[REFERENCES]-> Ticket
+        # Regex match can't use an index seek like the equality joins above,
+        # but correlating Commit inside a scoped subquery per Ticket row
+        # (rather than an open `MATCH (c),(t)`) still avoids the cartesian
+        # product notification, since Neo4j can plan it as a per-row nested
+        # loop against a bound `t` instead of a full cross join.
         result = session.run("""
-            MATCH (c:Commit), (t:Ticket)
-            WHERE c.message =~ ('(?i).*' + t.id + '.*')
-              AND NOT (c)-[:REFERENCES]->(t)
-            MERGE (c)-[:REFERENCES]->(t)
+            MATCH (t:Ticket)
+            CALL (t) {
+                MATCH (c:Commit)
+                WHERE c.message =~ ('(?i).*' + t.id + '.*')
+                  AND NOT (c)-[:REFERENCES]->(t)
+                MERGE (c)-[:REFERENCES]->(t)
+            }
         """)
         merged = result.consume().counters.relationships_created
         log.info("  Commit -[REFERENCES]-> Ticket: %d edge(s) created", merged)
 
         # BugReport references a commit  → BugReport -[CAUSED_BY]-> Commit
+        # Rewritten from `MATCH (b),(c) WHERE b.commit_ref = c.id` (a true
+        # cartesian product — every BugReport paired with every Commit
+        # before filtering) to a per-row index lookup: for each BugReport,
+        # look up the one Commit whose id matches via the range index on
+        # Commit.id. Neo4j plans the second MATCH as an indexed seek, not
+        # a scan-and-join, so this no longer triggers (or deserves) the
+        # cartesian product notification.
         result = session.run("""
-            MATCH (b:BugReport), (c:Commit)
-            WHERE b.commit_ref = c.id
-              AND b.commit_ref <> ''
-              AND NOT (b)-[:CAUSED_BY]->(c)
+            MATCH (b:BugReport)
+            WHERE b.commit_ref <> ''
+            MATCH (c:Commit {id: b.commit_ref})
+            WHERE NOT (b)-[:CAUSED_BY]->(c)
             MERGE (b)-[:CAUSED_BY]->(c)
         """)
         merged = result.consume().counters.relationships_created
@@ -914,10 +929,10 @@ def build_edges(driver) -> None:
 
         # BugReport references a Ticket  → already created inline; ensure symmetric link
         result = session.run("""
-            MATCH (b:BugReport), (t:Ticket)
-            WHERE b.ticket_ref = t.id
-              AND b.ticket_ref <> ''
-              AND NOT (b)-[:REFERENCES]->(t)
+            MATCH (b:BugReport)
+            WHERE b.ticket_ref <> ''
+            MATCH (t:Ticket {id: b.ticket_ref})
+            WHERE NOT (b)-[:REFERENCES]->(t)
             MERGE (b)-[:REFERENCES]->(t)
         """)
         merged = result.consume().counters.relationships_created
@@ -925,10 +940,10 @@ def build_edges(driver) -> None:
 
         # Decision governs a Ticket  → Decision -[GOVERNED_BY]-> Ticket
         result = session.run("""
-            MATCH (d:Decision), (t:Ticket)
-            WHERE d.related_ticket = t.id
-              AND d.related_ticket <> ''
-              AND NOT (d)-[:GOVERNED_BY]->(t)
+            MATCH (d:Decision)
+            WHERE d.related_ticket <> ''
+            MATCH (t:Ticket {id: d.related_ticket})
+            WHERE NOT (d)-[:GOVERNED_BY]->(t)
             MERGE (d)-[:GOVERNED_BY]->(t)
         """)
         merged = result.consume().counters.relationships_created
@@ -936,10 +951,10 @@ def build_edges(driver) -> None:
 
         # Decision shaped a Commit  → Decision -[SHAPES]-> Commit
         result = session.run("""
-            MATCH (d:Decision), (c:Commit)
-            WHERE d.related_commit = c.id
-              AND d.related_commit <> ''
-              AND NOT (d)-[:SHAPES]->(c)
+            MATCH (d:Decision)
+            WHERE d.related_commit <> ''
+            MATCH (c:Commit {id: d.related_commit})
+            WHERE NOT (d)-[:SHAPES]->(c)
             MERGE (d)-[:SHAPES]->(c)
         """)
         merged = result.consume().counters.relationships_created
@@ -947,12 +962,15 @@ def build_edges(driver) -> None:
 
         # ADR governs Decisions (link by project/title keyword overlap — best effort)
         result = session.run("""
-            MATCH (a:ADR), (d:Decision)
+            MATCH (a:ADR)
             WHERE a.repo IS NOT NULL
-              AND d.title IS NOT NULL
-              AND toLower(d.title) CONTAINS toLower(split(a.title, ':')[0])
-              AND NOT (a)-[:GOVERNED_BY]->(d)
-            MERGE (a)-[:GOVERNED_BY]->(d)
+            CALL (a) {
+                MATCH (d:Decision)
+                WHERE d.title IS NOT NULL
+                  AND toLower(d.title) CONTAINS toLower(split(a.title, ':')[0])
+                  AND NOT (a)-[:GOVERNED_BY]->(d)
+                MERGE (a)-[:GOVERNED_BY]->(d)
+            }
         """)
         merged = result.consume().counters.relationships_created
         log.info("  ADR -[GOVERNED_BY]-> Decision: %d edge(s) created (keyword match)", merged)
@@ -966,31 +984,44 @@ def build_edges(driver) -> None:
         # graph: link it to commits in the same repo whose message mentions
         # the ADR's title (same best-effort keyword approach as above).
         result = session.run("""
-            MATCH (a:ADR), (c:Commit)
-            WHERE a.repo = c.repo
-              AND toLower(c.message) CONTAINS toLower(split(a.title, ':')[0])
-              AND NOT (a)-[:REFERENCES]->(c)
-            MERGE (a)-[:REFERENCES]->(c)
+            MATCH (a:ADR)
+            CALL (a) {
+                MATCH (c:Commit)
+                WHERE a.repo = c.repo
+                  AND toLower(c.message) CONTAINS toLower(split(a.title, ':')[0])
+                  AND NOT (a)-[:REFERENCES]->(c)
+                MERGE (a)-[:REFERENCES]->(c)
+            }
         """)
         merged = result.consume().counters.relationships_created
         log.info("  ADR -[REFERENCES]-> Commit: %d edge(s) created (keyword match)", merged)
 
         # SlackMessage discusses a Ticket  → SlackMessage -[DISCUSSED_IN]-> Ticket
+        # Slack has no connection in this deployment (no SLACK_BOT_TOKEN),
+        # so SlackMessage will have 0 rows and this MATCH is a no-op — but
+        # it's kept correlated/indexable rather than an open cartesian join
+        # so it's cheap now and correct the moment Slack is connected.
         result = session.run("""
-            MATCH (m:SlackMessage), (t:Ticket)
-            WHERE m.text =~ ('(?i).*' + t.id + '.*')
-              AND NOT (m)-[:DISCUSSED_IN]->(t)
-            MERGE (m)-[:DISCUSSED_IN]->(t)
+            MATCH (t:Ticket)
+            CALL (t) {
+                MATCH (m:SlackMessage)
+                WHERE m.text =~ ('(?i).*' + t.id + '.*')
+                  AND NOT (m)-[:DISCUSSED_IN]->(t)
+                MERGE (m)-[:DISCUSSED_IN]->(t)
+            }
         """)
         merged = result.consume().counters.relationships_created
         log.info("  SlackMessage -[DISCUSSED_IN]-> Ticket: %d edge(s) created", merged)
 
         # SlackMessage discusses a Commit (SHA mention)
         result = session.run("""
-            MATCH (m:SlackMessage), (c:Commit)
-            WHERE m.text =~ ('(?i).*' + left(c.id, 7) + '.*')
-              AND NOT (m)-[:DISCUSSED_IN]->(c)
-            MERGE (m)-[:DISCUSSED_IN]->(c)
+            MATCH (c:Commit)
+            CALL (c) {
+                MATCH (m:SlackMessage)
+                WHERE m.text =~ ('(?i).*' + left(c.id, 7) + '.*')
+                  AND NOT (m)-[:DISCUSSED_IN]->(c)
+                MERGE (m)-[:DISCUSSED_IN]->(c)
+            }
         """)
         merged = result.consume().counters.relationships_created
         log.info("  SlackMessage -[DISCUSSED_IN]-> Commit: %d edge(s) created", merged)
