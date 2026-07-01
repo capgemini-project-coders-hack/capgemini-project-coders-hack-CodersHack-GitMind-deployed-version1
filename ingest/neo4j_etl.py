@@ -799,8 +799,27 @@ def synthesize_decisions_from_adrs(driver, repo: str) -> None:
             # ADR body — same shape regex used for commit/query ticket
             # extraction elsewhere in this codebase. Generic, no per-repo
             # config required.
-            ticket_match = _TICKET_KEY_RE.search(text) or _TICKET_KEY_RE.search(title)
-            related_ticket = ticket_match.group(0) if ticket_match else ""
+            #
+            # BUG (found via live debugging): ADR titles/IDs are themselves
+            # LETTERS-DIGITS shaped ("ADR-001"), matching this same regex.
+            # `.search()` returns the first hit, so on an ADR whose title
+            # starts with "ADR-001: ..." the match was always the ADR's own
+            # ID, never the real Jira key mentioned further down in the
+            # body (e.g. "RRW-011") — related_ticket silently got set to
+            # "ADR-001", which matches no Ticket node, so GOVERNED_BY was
+            # 0 edges on every ingest regardless of the cartesian-query
+            # fix. Exclude ADR-shaped tokens from candidate matches so the
+            # first real ticket key in the body wins instead.
+            candidates = [
+                m for m in _TICKET_KEY_RE.finditer(text)
+                if not m.group(0).startswith("ADR-")
+            ]
+            if not candidates:
+                candidates = [
+                    m for m in _TICKET_KEY_RE.finditer(title)
+                    if not m.group(0).startswith("ADR-")
+                ]
+            related_ticket = candidates[0].group(0) if candidates else ""
 
             # related_commit: the commit whose message references this
             # ADR's title keyword — same best-effort match build_edges()
