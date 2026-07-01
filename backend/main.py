@@ -1175,7 +1175,12 @@ def create_app() -> FastAPI:
         allow_origins=["*"] if _allow_all else _CORS_ORIGINS,
         allow_credentials=not _allow_all,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "Authorization"],
+        allow_headers=[
+            "Content-Type",
+            "Authorization",
+            "X-Slack-Request-Timestamp",
+            "X-Slack-Signature",
+        ],
     )
     
     app.include_router(router)
