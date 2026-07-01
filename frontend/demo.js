@@ -130,6 +130,30 @@ def analyze_repository(repo_url):
   const form = document.getElementById("analyzeForm");
   const repoUrlInput = document.getElementById("repoUrlInput");
   const analyzeBtn = document.getElementById("analyzeBtn");
+  const repoUrlError = document.getElementById("repoUrlError");
+
+  // ── GitHub repo URL validation ──────────────────────────────────────────
+  const GITHUB_REPO_RE = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?\/?$/;
+
+  function validateRepoUrl(url) {
+    const trimmed = (url || "").trim();
+    if (!trimmed) return "Enter a GitHub repository URL.";
+    if (!GITHUB_REPO_RE.test(trimmed)) {
+      return "Only GitHub repository URLs are supported (e.g. https://github.com/owner/repository).";
+    }
+    return null;
+  }
+
+  function setRepoUrlError(msg) {
+    if (!repoUrlError) return;
+    if (!msg) {
+      repoUrlError.style.display = "none";
+      repoUrlError.textContent = "";
+      return;
+    }
+    repoUrlError.style.display = "block";
+    repoUrlError.textContent = msg;
+  }
 
   const statusBox = document.getElementById("statusBox");
   const statsBox = document.getElementById("statsBox");
@@ -1029,6 +1053,12 @@ def analyze_repository(repo_url):
   // ── Form submit ──────────────────────────────────────────────────────────
   form.addEventListener("submit", (e) => {
     e.preventDefault();
+    const err = validateRepoUrl(repoUrlInput.value);
+    if (err) {
+      setRepoUrlError(err);
+      return;
+    }
+    setRepoUrlError(null);
     runAnalysis(repoUrlInput.value);
   });
 
