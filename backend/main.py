@@ -169,19 +169,73 @@ FACT_WORDS = ("list", "count", "summarize the text of", "summarise the text of",
 
 # owner/repo, optionally as a full GitHub URL — used to validate /ingest/repo
 # input before it ever reaches GitHub/Snowflake/Neo4j calls.
-_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_GITHUB_URL_RE = re.compile(r"github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?(?:$|[/?#])")
+#
+# GitHub username rules: alphanumeric + single hyphens, no leading/trailing/
+# doubled hyphen, max 39 chars. Repo name rules: alnum, ., _, - (GitHub
+# itself is looser than this in practice, but this is a validation
+# boundary, not a mirror of GitHub's own rules — tighter is safer here).
+_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
+_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+_REPO_SLUG_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38})/([A-Za-z0-9._-]{1,100})$")
+
+# Accepted GitHub hosts — exact match only, checked against urlparse().netloc,
+# never as a substring of the raw string. "evilgithub.com" or
+# "github.com.attacker.net" must never satisfy this.
+_GITHUB_HOSTS = {"github.com", "www.github.com"}
 
 
 def normalize_repo_slug(raw: str) -> str:
-    """Accepts 'owner/repo' or any github.com/owner/repo URL, returns 'owner/repo'."""
+    """Accepts 'owner/repo' or a genuine https://github.com/owner/repo URL,
+    returns 'owner/repo'. Rejects (with a logged warning) anything else,
+    including strings that merely *contain* 'github.com' as a substring —
+    e.g. 'evilgithub.com/owner/repo' or 'github.com.attacker.net/owner/repo'
+    used to look like a match under a naive substring/regex .search().
+    """
+    from urllib.parse import urlparse
+
+    original = raw
     raw = raw.strip()
-    m = _GITHUB_URL_RE.search(raw)
-    if m:
-        return f"{m.group(1)}/{m.group(2)}"
+
+    looks_like_url = "://" in raw or raw.lower().startswith("github.com") or raw.lower().startswith("www.github.com")
+
+    if looks_like_url:
+        # Force a scheme so urlparse reliably splits netloc from path even
+        # for inputs like "github.com/owner/repo" with no "https://".
+        parse_target = raw if "://" in raw else f"https://{raw}"
+        parsed = urlparse(parse_target)
+        host = parsed.netloc.lower().split("@")[-1].split(":")[0]  # strip userinfo@ and :port
+
+        if host not in _GITHUB_HOSTS:
+            log.warning("Rejected /ingest/repo input — host %r is not github.com: %r", host, original)
+            raise ValueError(
+                f"Expected a github.com repository URL or 'owner/repo', got a URL with host {host!r}: {original!r}"
+            )
+
+        segments = [s for s in parsed.path.split("/") if s]
+        if len(segments) < 2:
+            log.warning("Rejected /ingest/repo input — no owner/repo path on github.com URL: %r", original)
+            raise ValueError(f"Could not find owner/repo in GitHub URL path: {original!r}")
+
+        owner, repo_name = segments[0], segments[1]
+        repo_name = re.sub(r"\.git$", "", repo_name)
+
+        if len(segments) > 2:
+            log.warning(
+                "Ingest input had extra path segments beyond owner/repo — using only %s/%s, ignoring %r",
+                owner, repo_name, segments[2:],
+            )
+
+        if not _OWNER_RE.match(owner) or not _REPO_NAME_RE.match(repo_name):
+            log.warning("Rejected /ingest/repo input — owner/repo failed identifier rules: %r", original)
+            raise ValueError(f"Owner or repo name contains disallowed characters: {owner!r}/{repo_name!r}")
+
+        return f"{owner}/{repo_name}"
+
     if _REPO_SLUG_RE.match(raw):
         return raw
-    raise ValueError(f"Could not parse a GitHub 'owner/repo' from: {raw!r}")
+
+    log.warning("Rejected /ingest/repo input — not a github.com URL or valid owner/repo slug: %r", original)
+    raise ValueError(f"Could not parse a GitHub 'owner/repo' from: {original!r}")
 
 
 def classify_intent(query: str) -> QueryIntent:
