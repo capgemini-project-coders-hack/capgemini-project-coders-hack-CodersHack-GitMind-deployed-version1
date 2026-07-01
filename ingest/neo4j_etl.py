@@ -526,8 +526,119 @@ def _adf_to_text(adf: dict) -> str:
 # Step 4: Slack → SlackMessage nodes
 # ---------------------------------------------------------------------------
 
-def ingest_messages(driver, channel_id: str, limit_days: int = 90) -> None:
+def _fetch_repo_local_messages(repo: str, path: str = "slack/messages.json") -> dict | None:
+    """Same detection pattern as _fetch_repo_local_tickets: a repo can ship
+    slack/messages.json as a static export instead of requiring a live
+    SLACK_BOT_TOKEN + --channel. Kept duplicated (not shared) for the same
+    reason as the ticket fallback -- no cross-module import between the two
+    independent ETL CLIs.
+    """
     import requests
+
+    token = os.getenv("GITHUB_TOKEN")
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    owner, repo_name = repo.split("/", 1)
+    resp = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}/contents/{path}",
+        headers=headers, timeout=15,
+    )
+    if not resp.ok:
+        return None
+    try:
+        raw = base64.b64decode(resp.json().get("content", "")).decode("utf-8", errors="replace")
+        data = json.loads(raw)
+    except Exception as exc:
+        log.warning("Found %s in %s but couldn't parse it as JSON: %s", path, repo, exc)
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+        log.warning("%s in %s doesn't match expected {channel, messages:[...]} shape — ignoring.", path, repo)
+        return None
+    return data
+
+
+def ingest_messages(
+    driver,
+    channel_id: str | None = None,
+    limit_days: int = 90,
+    repo: str | None = None,
+    local_messages_path: str = "slack/messages.json",
+) -> None:
+    import requests
+
+    if repo:
+        local = _fetch_repo_local_messages(repo, local_messages_path)
+        if local is not None:
+            local_channel_id   = local.get("channel_id") or channel_id or "local"
+            local_channel_name = local.get("channel") or local_channel_id
+            log.info("Found local message file '%s' in %s (channel=%s) — using it instead of live Slack.",
+                      local_messages_path, repo, local_channel_name)
+
+            inserted = 0
+            with driver.session(database=_db(driver)) as session:
+                for msg in local["messages"]:
+                    ts = msg.get("ts")
+                    if not ts:
+                        continue
+                    msg_id = f"{local_channel_id}:{ts}"
+                    try:
+                        ts_dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+                        timestamp = ts_dt.isoformat()
+                    except (TypeError, ValueError):
+                        # slack/messages.json may store ISO timestamps directly
+                        # instead of Slack's raw epoch `ts` string.
+                        timestamp = str(ts)
+
+                    _merge_node(session, "SlackMessage", msg_id, {
+                        "channel_id":   local_channel_id,
+                        "channel_name": local_channel_name,
+                        "user_id":      msg.get("user", ""),
+                        "text":         str(msg.get("text", ""))[:2000],
+                        "summary":      str(msg.get("text", ""))[:300],
+                        "timestamp":    timestamp,
+                        "thread_ts":    msg.get("thread_ts", ""),
+                    })
+                    inserted += 1
+
+                    # Same directness trick as ingest_tickets' local path: if
+                    # the file states exactly which commits/tickets a message
+                    # discusses, wire DISCUSSED_IN here instead of leaving it
+                    # to build_edges()'s regex/keyword match, which silently
+                    # produces zero edges for messages that don't happen to
+                    # contain a literal ticket key or full commit sha.
+                    for sha in msg.get("commits", []) or []:
+                        result = session.run(
+                            """
+                            MATCH (a:SlackMessage {id: $msg_id})
+                            MATCH (b:Commit) WHERE b.id STARTS WITH $sha
+                            MERGE (a)-[r:DISCUSSED_IN]->(b)
+                            RETURN count(r) AS merged
+                            """,
+                            msg_id=msg_id, sha=sha,
+                        )
+                        if result.single()["merged"]:
+                            log.info("  SlackMessage %s -[DISCUSSED_IN]-> Commit (sha=%s) via local file.", msg_id, sha)
+                    for key in msg.get("tickets", []) or []:
+                        result = session.run(
+                            """
+                            MATCH (a:SlackMessage {id: $msg_id})
+                            MATCH (b:Ticket {id: $key})
+                            MERGE (a)-[r:DISCUSSED_IN]->(b)
+                            RETURN count(r) AS merged
+                            """,
+                            msg_id=msg_id, key=key,
+                        )
+                        if result.single()["merged"]:
+                            log.info("  SlackMessage %s -[DISCUSSED_IN]-> Ticket %s via local file.", msg_id, key)
+
+            log.info("  Merged %d SlackMessage nodes from local file (channel=%s).", inserted, local_channel_name)
+            return
+
+    if not channel_id:
+        log.warning("No slack/messages.json found and no --channel given — skipping message ingestion.")
+        return
 
     token   = _require("SLACK_BOT_TOKEN")
     headers = {"Authorization": f"Bearer {token}"}
@@ -933,10 +1044,10 @@ def main(argv: list[str] | None = None) -> int:
         if step in ("all", "tickets"):
             ingest_tickets(driver, repo=args.repo or None, project=args.project)
         if step in ("all", "messages"):
-            if not args.channel:
-                log.error("--channel required for messages step")
+            if not args.channel and not args.repo:
+                log.error("--channel or --repo (with slack/messages.json) required for messages step")
                 return 1
-            ingest_messages(driver, args.channel)
+            ingest_messages(driver, args.channel, repo=args.repo or None)
         if step in ("all", "adrs"):
             if not args.repo:
                 log.error("--repo required for adrs step")
