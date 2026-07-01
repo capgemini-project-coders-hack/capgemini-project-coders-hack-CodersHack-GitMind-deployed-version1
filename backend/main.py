@@ -627,7 +627,22 @@ def _run_repo_ingest_job(
         # request fields, not assumed constants.
         from ingest.run_ingest import run as ingest_run
 
-        channel = _os.environ.get("GITMIND_INGEST_CHANNEL") or _first_csv_env("SLACK_DEFAULT_CHANNELS")
+        # Only pass a channel through if Slack is actually connected (a bot
+        # token is set). A channel name alone isn't a connection — without
+        # a token the messages step still fires and dies on `missing_scope`,
+        # which is noise in the log and wasted API calls, not a real ETL
+        # step. No token => Slack is treated as not-connected => the step
+        # is skipped entirely (see run_ingest.run()'s `if channel:` guard).
+        slack_bot_token = _os.environ.get("SLACK_BOT_TOKEN", "")
+        channel = (
+            (_os.environ.get("GITMIND_INGEST_CHANNEL") or _first_csv_env("SLACK_DEFAULT_CHANNELS"))
+            if slack_bot_token else ""
+        )
+        if not slack_bot_token:
+            log.info("SLACK_BOT_TOKEN not set - Slack has no connection, skipping messages step for this ingest.")
+
+        # Jira is resolved and passed independently of Slack's channel gate -
+        # ticket ingestion never depends on whether Slack is connected.
         rc = ingest_run(
             repo=repo,
             branch=branch,
