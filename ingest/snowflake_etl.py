@@ -40,6 +40,45 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message
 
 
 # ---------------------------------------------------------------------------
+# PERF: shared requests.Session — every GitHub/Jira/Slack call in this file
+# used to be a bare requests.get(...) call, each opening a brand-new TCP+TLS
+# connection. Reusing one Session lets urllib3 keep-alive connections to
+# the same host (api.github.com, the Jira host, slack.com) across calls
+# instead of re-handshaking every time.
+#
+# Thread-safety: requests.Session wraps a urllib3 connection-pooled
+# HTTPAdapter, which is safe for concurrent .get() calls from multiple
+# threads as long as no thread mutates session-level state (headers/
+# auth/cookies) after creation -- this module never does that; every call
+# site still passes its own per-call headers=/params=/auth=/timeout= as
+# kwargs exactly like the plain requests.get() calls it replaces. This
+# matters because ingest_commits()'s ThreadPoolExecutor (see PERF comment
+# there) calls this session concurrently from up to 20 worker threads --
+# pool_maxsize=20 below matches that cap so urllib3 doesn't have to keep
+# discarding/reopening connections once the pool is full.
+# ---------------------------------------------------------------------------
+
+import threading
+
+_session_lock = threading.Lock()
+_SESSION = None
+
+
+def _get_session():
+    global _SESSION
+    if _SESSION is None:
+        with _session_lock:
+            if _SESSION is None:
+                import requests
+                s = requests.Session()
+                adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+                s.mount("https://", adapter)
+                s.mount("http://", adapter)
+                _SESSION = s
+    return _SESSION
+
+
+# ---------------------------------------------------------------------------
 # Connection
 # ---------------------------------------------------------------------------
 
@@ -418,13 +457,15 @@ def reset_all(conn=None) -> None:
 # Step 2: Commits
 # ---------------------------------------------------------------------------
 
-def _list_branches(owner: str, repo_name: str, headers: dict) -> list[str]:
-    import requests
+def _list_branches(owner: str, repo_name: str, headers: dict, cache: dict | None = None) -> list[str]:
+    cache_key = ("branches", owner, repo_name)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
 
     branches: list[str] = []
     page = 1
     while True:
-        resp = requests.get(
+        resp = _get_session().get(
             f"https://api.github.com/repos/{owner}/{repo_name}/branches",
             params={"per_page": 100, "page": page},
             headers=headers, timeout=30,
@@ -437,10 +478,13 @@ def _list_branches(owner: str, repo_name: str, headers: dict) -> list[str]:
         if len(batch) < 100:
             break
         page += 1
+
+    if cache is not None:
+        cache[cache_key] = branches
     return branches
 
 
-def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None:
+def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10, cache: dict | None = None) -> None:
     # max_pages=10 * per_page=100 = 1000 commits cap PER BRANCH.
     # `branch` is kept only for CLI back-compat and ignored below: commits
     # are now pulled for EVERY branch (deduped by sha), matching
@@ -458,7 +502,7 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
     owner, repo_name = repo.split("/", 1)
 
     pinned = os.getenv("GITMIND_INGEST_BRANCH", "")
-    branches = _list_branches(owner, repo_name, headers)
+    branches = _list_branches(owner, repo_name, headers, cache=cache)
     if not branches:
         branches = [branch]
     if pinned:
@@ -488,13 +532,19 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
     commits_by_sha: dict[str, dict] = {}
     for b_name in branches:
         for page in range(1, max_pages + 1):
-            resp = requests.get(
-                f"https://api.github.com/repos/{owner}/{repo_name}/commits",
-                params={"sha": b_name, "per_page": 100, "page": page},
-                headers=headers, timeout=30,
-            )
-            resp.raise_for_status()
-            batch = resp.json()
+            page_key = ("commits_page", owner, repo_name, b_name, page)
+            if cache is not None and page_key in cache:
+                batch = cache[page_key]
+            else:
+                resp = _get_session().get(
+                    f"https://api.github.com/repos/{owner}/{repo_name}/commits",
+                    params={"sha": b_name, "per_page": 100, "page": page},
+                    headers=headers, timeout=30,
+                )
+                resp.raise_for_status()
+                batch = resp.json()
+                if cache is not None:
+                    cache[page_key] = batch
             if not batch:
                 break
             for c in batch:
@@ -531,7 +581,7 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
         additions = deletions = files_changed = 0
         patch_summary = ""
         try:
-            detail = requests.get(
+            detail = _get_session().get(
                 f"https://api.github.com/repos/{owner}/{repo_name}/commits/{sha}",
                 headers=headers, timeout=15,
             ).json()
@@ -598,7 +648,7 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
 # Step 3: Tickets (Jira)
 # ---------------------------------------------------------------------------
 
-def _fetch_repo_local_tickets(repo: str, path: str = "jira/issues.json") -> dict | None:
+def _fetch_repo_local_tickets(repo: str, path: str = "jira/issues.json", cache: dict | None = None) -> dict | None:
     """Look for a committed ticket file (e.g. jira/issues.json) in the repo.
 
     Some repos (anything without a real, externally-hosted Jira instance)
@@ -617,7 +667,9 @@ def _fetch_repo_local_tickets(repo: str, path: str = "jira/issues.json") -> dict
     Only "id" and "title" are required per issue; everything else is
     optional and defaults to empty/false if absent.
     """
-    import requests
+    cache_key = ("local_tickets", repo, path)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
 
     token = os.getenv("GITHUB_TOKEN")
     headers = {"Accept": "application/vnd.github+json"}
@@ -625,21 +677,29 @@ def _fetch_repo_local_tickets(repo: str, path: str = "jira/issues.json") -> dict
         headers["Authorization"] = f"Bearer {token}"
 
     owner, repo_name = repo.split("/", 1)
-    resp = requests.get(
+    resp = _get_session().get(
         f"https://api.github.com/repos/{owner}/{repo_name}/contents/{path}",
         headers=headers, timeout=15,
     )
     if not resp.ok:
+        if cache is not None:
+            cache[cache_key] = None
         return None
     try:
         raw = base64.b64decode(resp.json().get("content", "")).decode("utf-8", errors="replace")
         data = json.loads(raw)
     except Exception as exc:
         log.warning("Found %s in %s but couldn't parse it as JSON: %s", path, repo, exc)
+        if cache is not None:
+            cache[cache_key] = None
         return None
     if not isinstance(data, dict) or not isinstance(data.get("issues"), list):
         log.warning("%s in %s doesn't match expected {project, issues:[...]} shape — ignoring.", path, repo)
+        if cache is not None:
+            cache[cache_key] = None
         return None
+    if cache is not None:
+        cache[cache_key] = data
     return data
 
 
@@ -648,6 +708,7 @@ def ingest_tickets(
     project: str | None = None,
     max_results: int = 5000,
     local_tickets_path: str = "jira/issues.json",
+    cache: dict | None = None,
 ) -> None:
     import requests
     from requests.auth import HTTPBasicAuth
@@ -656,7 +717,7 @@ def ingest_tickets(
     # _fetch_repo_local_tickets() docstring for why. Falls through to the
     # unchanged live-API path below if no such file exists for this repo.
     if repo:
-        local = _fetch_repo_local_tickets(repo, local_tickets_path)
+        local = _fetch_repo_local_tickets(repo, local_tickets_path, cache=cache)
         if local is not None:
             local_project = (local.get("project") or {}).get("key") or project or repo
             log.info("Found local ticket file '%s' in %s (project=%s) — using it instead of live Jira.",
@@ -754,9 +815,15 @@ def ingest_tickets(
         elif not is_atlassian_cloud:
             params["startAt"] = start_at
 
-        resp = requests.get(search_url, params=params, auth=auth, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
+        page_key = ("jira_page", search_url, tuple(sorted(params.items())))
+        if cache is not None and page_key in cache:
+            data = cache[page_key]
+        else:
+            resp = _get_session().get(search_url, params=params, auth=auth, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if cache is not None:
+                cache[page_key] = data
         issues = data.get("issues", [])
         if not issues:
             break
@@ -840,21 +907,27 @@ def _adf_to_text(adf: dict) -> str:
 # Step 4: Slack → MESSAGES
 # ---------------------------------------------------------------------------
 
-def ingest_messages(channel_id: str, limit_days: int = 90) -> None:
+def ingest_messages(channel_id: str, limit_days: int = 90, cache: dict | None = None) -> None:
     import requests
 
     token = _require("SLACK_BOT_TOKEN")
     headers = {"Authorization": f"Bearer {token}"}
 
     channel_name = channel_id
-    try:
-        info = requests.get(
-            "https://slack.com/api/conversations.info",
-            params={"channel": channel_id}, headers=headers, timeout=15,
-        ).json()
-        channel_name = info.get("channel", {}).get("name", channel_id)
-    except Exception:
-        pass
+    info_key = ("slack_info", channel_id)
+    if cache is not None and info_key in cache:
+        channel_name = cache[info_key]
+    else:
+        try:
+            info = _get_session().get(
+                "https://slack.com/api/conversations.info",
+                params={"channel": channel_id}, headers=headers, timeout=15,
+            ).json()
+            channel_name = info.get("channel", {}).get("name", channel_id)
+        except Exception:
+            pass
+        if cache is not None:
+            cache[info_key] = channel_name
 
     log.info("Fetching Slack messages from #%s...", channel_name)
 
@@ -867,12 +940,23 @@ def ingest_messages(channel_id: str, limit_days: int = 90) -> None:
         if cursor:
             params["cursor"] = cursor
 
-        resp = requests.get(
-            "https://slack.com/api/conversations.history",
-            params=params, headers=headers, timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        # Cache key intentionally excludes 'oldest' (a wall-clock cutoff
+        # that drifts by a few seconds between this call and the sibling
+        # pipeline's call within the same run) and 'limit' (always 200
+        # here) -- (channel_id, cursor) alone is enough to identify "the
+        # same history page" for reuse purposes.
+        page_key = ("slack_history_page", channel_id, cursor)
+        if cache is not None and page_key in cache:
+            data = cache[page_key]
+        else:
+            resp = _get_session().get(
+                "https://slack.com/api/conversations.history",
+                params=params, headers=headers, timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if cache is not None:
+                cache[page_key] = data
         if not data.get("ok"):
             log.error("Slack error: %s", data.get("error"))
             break
@@ -931,7 +1015,7 @@ def ingest_messages(channel_id: str, limit_days: int = 90) -> None:
 # Step 5: ADRs
 # ---------------------------------------------------------------------------
 
-def ingest_adrs(repo: str, adr_path: str = "docs/adr") -> None:
+def ingest_adrs(repo: str, adr_path: str = "docs/adr", cache: dict | None = None) -> None:
     import requests
 
     token = os.getenv("GITHUB_TOKEN")
@@ -942,23 +1026,47 @@ def ingest_adrs(repo: str, adr_path: str = "docs/adr") -> None:
     owner, repo_name = repo.split("/", 1)
     log.info("Scanning %s/%s for ADRs in '%s'...", owner, repo_name, adr_path)
 
-    resp = requests.get(
-        f"https://api.github.com/repos/{owner}/{repo_name}/contents/{adr_path}",
-        headers=headers, timeout=15,
-    )
-    if not resp.ok:
-        log.warning("  ADR path not found in %s (%s).", repo, resp.status_code)
+    listing_key = ("adr_listing", owner, repo_name, adr_path)
+    if cache is not None and listing_key in cache:
+        listing = cache[listing_key]
+    else:
+        resp = _get_session().get(
+            f"https://api.github.com/repos/{owner}/{repo_name}/contents/{adr_path}",
+            headers=headers, timeout=15,
+        )
+        if not resp.ok:
+            log.warning("  ADR path not found in %s (%s).", repo, resp.status_code)
+            if cache is not None:
+                cache[listing_key] = None
+            return
+        listing = resp.json()
+        if cache is not None:
+            cache[listing_key] = listing
+
+    if listing is None:
+        log.warning("  ADR path not found in %s.", repo)
         return
 
-    files = [f for f in resp.json() if f.get("name", "").endswith(".md")]
+    files = [f for f in listing if f.get("name", "").endswith(".md")]
     log.info("  Found %d ADR files.", len(files))
 
     rows: list[tuple] = []
     for f in files:
-        content_resp = requests.get(f["url"], headers=headers, timeout=15)
-        if not content_resp.ok:
+        content_key = ("adr_content", f["url"])
+        if cache is not None and content_key in cache:
+            content_json = cache[content_key]
+        else:
+            content_resp = _get_session().get(f["url"], headers=headers, timeout=15)
+            if not content_resp.ok:
+                if cache is not None:
+                    cache[content_key] = None
+                continue
+            content_json = content_resp.json()
+            if cache is not None:
+                cache[content_key] = content_json
+        if content_json is None:
             continue
-        raw = base64.b64decode(content_resp.json().get("content", "")).decode("utf-8", errors="replace")
+        raw = base64.b64decode(content_json.get("content", "")).decode("utf-8", errors="replace")
         title = _extract_section(raw, r"^#\s+(.+)$") or f["name"]
         status = _extract_section(raw, r"[Ss]tatus[:\s]+(.+)")
         context = _extract_section(raw, r"## Context\s+([\s\S]+?)(?=##|$)")
@@ -1023,7 +1131,7 @@ def _extract_section(text: str, pattern: str) -> str:
 # CLI
 # ---------------------------------------------------------------------------
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, cache: dict | None = None) -> int:
     parser = argparse.ArgumentParser(description="GitMind Snowflake ETL")
     parser.add_argument("--step", default="all",
                         choices=["all", "ddl", "commits", "tickets", "messages", "adrs", "reset"])
@@ -1063,14 +1171,14 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         else:
             try:
-                ingest_commits(repo, branch=args.branch, max_pages=args.max_pages)
+                ingest_commits(repo, branch=args.branch, max_pages=args.max_pages, cache=cache)
             except Exception as exc:
                 log.error("commits step failed: %s", exc)
 
     if step in ("all", "tickets"):
         repo = args.repo or os.getenv("GITHUB_DEFAULT_REPOS", "")
         try:
-            ingest_tickets(repo=repo or None, project=args.project)
+            ingest_tickets(repo=repo or None, project=args.project, cache=cache)
         except Exception as exc:
             log.error("tickets step failed: %s", exc)
 
@@ -1080,7 +1188,7 @@ def main(argv: list[str] | None = None) -> int:
             log.warning("No channel set — skipping messages step.")
         else:
             try:
-                ingest_messages(channel)
+                ingest_messages(channel, cache=cache)
             except Exception as exc:
                 log.error("messages step failed: %s", exc)
 
@@ -1090,7 +1198,7 @@ def main(argv: list[str] | None = None) -> int:
             log.warning("No repo set — skipping adrs step.")
         else:
             try:
-                ingest_adrs(repo, adr_path=args.adr_path)
+                ingest_adrs(repo, adr_path=args.adr_path, cache=cache)
             except Exception as exc:
                 log.error("adrs step failed: %s", exc)
 
