@@ -170,6 +170,65 @@ def _merge_rel(session, from_id: str, from_label: str,
 
 
 # ---------------------------------------------------------------------------
+# PERF: batch versions of _merge_node / _merge_rel — one UNWIND-driven
+# query per chunk (default 500 rows) instead of one MERGE per node/edge.
+# Same MERGE semantics as the singular helpers above: same node_id/
+# source_type/source_id assignment, same arbitrary extra props, same
+# idempotent MERGE-not-CREATE behavior on re-ingest. Every call site this
+# replaces always passes the same fixed prop-key shape across all rows
+# for a given label (e.g. every Commit row has exactly
+# repo/branch/author/message/summary/timestamp/url), which is what makes
+# a single UNWIND ... SET clause valid for the whole batch.
+# ---------------------------------------------------------------------------
+
+def _merge_nodes_batch(session, label: str, rows: list[dict], batch_size: int = 500) -> None:
+    """Batch MERGE for `label` nodes.
+
+    Each dict in `rows` must contain 'node_id' plus the same prop keys
+    _merge_node's `props` dict would have held for that label -- this
+    sets identical n.node_id / n.source_type / n.source_id / extra-prop
+    fields as N calls to _merge_node would have, just batched.
+    """
+    if not rows:
+        return
+    prop_keys = [k for k in rows[0].keys() if k != "node_id"]
+    set_clause = ", ".join(f"n.{k} = row.{k}" for k in prop_keys)
+    cypher = f"""
+        UNWIND $rows AS row
+        MERGE (n:{label} {{id: row.node_id}})
+        SET n.node_id = row.node_id,
+            n.source_type = '{label}',
+            n.source_id = row.node_id
+            {", " + set_clause if set_clause else ""}
+    """
+    for i in range(0, len(rows), batch_size):
+        session.run(cypher, rows=rows[i:i + batch_size])
+
+
+def _merge_rels_batch(session, from_label: str, rel: str, to_label: str,
+                       pairs: list[tuple[str, str]], batch_size: int = 500) -> None:
+    """Batch MERGE for (from_label)-[rel]->(to_label) edges, matched by id.
+
+    `pairs` is a list of (from_id, to_id) tuples -- same MATCH-by-id +
+    MERGE-the-edge semantics as N calls to _merge_rel(..., props=None),
+    just batched. Edges with props aren't covered here since none of the
+    batch-eligible call sites use them (props=None in every case this
+    replaces).
+    """
+    if not pairs:
+        return
+    cypher = f"""
+        UNWIND $pairs AS pair
+        MATCH (a:{from_label} {{id: pair[0]}})
+        MATCH (b:{to_label}   {{id: pair[1]}})
+        MERGE (a)-[r:{rel}]->(b)
+    """
+    for i in range(0, len(pairs), batch_size):
+        chunk = pairs[i:i + batch_size]
+        session.run(cypher, pairs=[[f, t] for f, t in chunk])
+
+
+# ---------------------------------------------------------------------------
 # Step 2: Commits
 # ---------------------------------------------------------------------------
 
@@ -259,6 +318,7 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
 
     log.info("  Merging %d Commit nodes...", len(commits_by_sha))
     with driver.session(database=_db(driver)) as session:
+        node_rows = []
         for sha, entry in commits_by_sha.items():
             c           = entry["commit"]
             commit_data = c.get("commit", {})
@@ -266,7 +326,8 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
             message     = commit_data.get("message", "")
             ts_raw      = author_data.get("date", "")
 
-            _merge_node(session, "Commit", sha, {
+            node_rows.append({
+                "node_id":   sha,
                 "repo":      repo,
                 "branch":    entry["branch"],
                 "author":    (c.get("author") or {}).get("login") or author_data.get("name", ""),
@@ -275,6 +336,10 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
                 "timestamp": ts_raw,
                 "url":       c.get("html_url", ""),
             })
+        # PERF: was one _merge_node() call per commit (N MERGE round
+        # trips). Batched via UNWIND -- identical id/props end up MERGEd
+        # on each Commit node, just ceil(N/500) round trips instead of N.
+        _merge_nodes_batch(session, "Commit", node_rows)
 
         log.info("  Done — %d Commit nodes merged.", len(commits_by_sha))
 
@@ -282,16 +347,18 @@ def ingest_commits(driver, repo: str, branch: str = "main", max_pages: int = 10)
         # parents of merge commits and across every branch. Lets trace()
         # walk real commit history even when no Jira/Slack/ADR/bug data
         # exists to link things together.
-        edge_count = 0
+        edge_pairs: list[tuple[str, str]] = []
         for sha, entry in commits_by_sha.items():
             for parent in entry["commit"].get("parents", []):
                 parent_sha = parent.get("sha")
                 if not parent_sha or parent_sha not in commits_by_sha:
                     continue
-                _merge_rel(session, sha, "Commit", "CAUSED_BY", parent_sha, "Commit")
-                edge_count += 1
+                edge_pairs.append((sha, parent_sha))
+        # PERF: was one _merge_rel() call per parent edge (N MERGE round
+        # trips). Same MATCH-by-id + MERGE(CAUSED_BY) semantics, batched.
+        _merge_rels_batch(session, "Commit", "CAUSED_BY", "Commit", edge_pairs)
 
-        log.info("  Done — %d Commit -[CAUSED_BY]-> Commit edges merged.", edge_count)
+        log.info("  Done — %d Commit -[CAUSED_BY]-> Commit edges merged.", len(edge_pairs))
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +413,11 @@ def ingest_tickets(
             log.info("Found local ticket file '%s' in %s (project=%s) — using it instead of live Jira.",
                       local_tickets_path, repo, local_project)
             with driver.session(database=_db(driver)) as session:
+                ticket_rows: list[dict] = []
+                bug_rows: list[dict] = []
+                bug_ticket_pairs: list[tuple[str, str]] = []
+                sha_edge_specs: list[tuple[str, list[str]]] = []
+
                 for issue in local["issues"]:
                     key = issue.get("id")
                     if not key:
@@ -353,7 +425,8 @@ def ingest_tickets(
                     issue_type = issue.get("type", "")
                     is_bug = issue_type.lower() in ("bug", "incident", "defect")
 
-                    _merge_node(session, "Ticket", key, {
+                    ticket_rows.append({
+                        "node_id": key,
                         "project": local_project,
                         "summary": str(issue.get("title", ""))[:1000],
                         "text": str(issue.get("description", ""))[:4000],
@@ -367,7 +440,8 @@ def ingest_tickets(
                     })
 
                     if is_bug:
-                        _merge_node(session, "BugReport", f"bug:{key}", {
+                        bug_rows.append({
+                            "node_id": f"bug:{key}",
                             "ticket_ref": key,
                             "title": str(issue.get("title", ""))[:500],
                             "summary": str(issue.get("description", ""))[:2000],
@@ -375,26 +449,44 @@ def ingest_tickets(
                             "status": issue.get("status", ""),
                             "reported_at": "",
                         })
-                        _merge_rel(session, f"bug:{key}", "BugReport", "REFERENCES", key, "Ticket")
+                        bug_ticket_pairs.append((f"bug:{key}", key))
 
-                    # The local ticket file states exactly which commit SHAs
-                    # belong to this issue. That's a direct, reliable signal —
-                    # use it instead of relying on build_edges()'s regex match
-                    # against commit messages, which silently produces zero
-                    # edges for any repo whose commit messages don't happen to
-                    # contain the ticket key as a literal substring (true for
-                    # most repos that don't follow Conventional Commits-style
-                    # "PROJ-123: ..." prefixes).
-                    # jira/issues.json stores 7-char short shas (GitHub's
-                    # display convention), but ingest_commits() MERGEs
-                    # Commit nodes with the full 40-char sha as `id`. A
-                    # plain _merge_rel({id: $sha}) MATCH therefore finds
-                    # zero rows and Cypher silently skips the downstream
-                    # MERGE -- no error, no log, the edge just never
-                    # exists. STARTS WITH matches the short sha as a
-                    # prefix of the real id instead.
+                    if issue.get("commits"):
+                        sha_edge_specs.append((key, issue.get("commits") or []))
+
+                # PERF: was one _merge_node() call per Ticket + one per
+                # BugReport + one _merge_rel() per bug->ticket edge (up to
+                # 3N MERGE round trips). Same node ids/props and same
+                # BugReport-[REFERENCES]->Ticket edges, batched via UNWIND.
+                _merge_nodes_batch(session, "Ticket", ticket_rows)
+                _merge_nodes_batch(session, "BugReport", bug_rows)
+                _merge_rels_batch(session, "BugReport", "REFERENCES", "Ticket", bug_ticket_pairs)
+
+                # The local ticket file states exactly which commit SHAs
+                # belong to this issue. That's a direct, reliable signal —
+                # use it instead of relying on build_edges()'s regex match
+                # against commit messages, which silently produces zero
+                # edges for any repo whose commit messages don't happen to
+                # contain the ticket key as a literal substring (true for
+                # most repos that don't follow Conventional Commits-style
+                # "PROJ-123: ..." prefixes).
+                # jira/issues.json stores 7-char short shas (GitHub's
+                # display convention), but ingest_commits() MERGEs
+                # Commit nodes with the full 40-char sha as `id`. A
+                # plain _merge_rel({id: $sha}) MATCH therefore finds
+                # zero rows and Cypher silently skips the downstream
+                # MERGE -- no error, no log, the edge just never
+                # exists. STARTS WITH matches the short sha as a
+                # prefix of the real id instead.
+                # NOTE: this is a prefix (STARTS WITH) match, not an
+                # exact-id match, so it isn't a fit for the generic
+                # _merge_rels_batch helper above (which MATCHes by exact
+                # {id: pair[N]}) without changing what gets matched --
+                # left as its own per-issue loop, run after the Ticket
+                # nodes it depends on are guaranteed to already exist.
+                for key, shas in sha_edge_specs:
                     ticket_commit_edges = 0
-                    for sha in issue.get("commits", []) or []:
+                    for sha in shas:
                         result = session.run(
                             """
                             MATCH (a:Commit) WHERE a.id STARTS WITH $sha
@@ -462,6 +554,10 @@ def ingest_tickets(
             break
 
         with driver.session(database=_db(driver)) as session:
+            ticket_rows: list[dict] = []
+            bug_rows: list[dict] = []
+            bug_ticket_pairs: list[tuple[str, str]] = []
+
             for issue in issues:
                 key    = issue["key"]
                 fields = issue.get("fields", {})
@@ -476,7 +572,8 @@ def ingest_tickets(
                 issue_type = _text(fields.get("issuetype"), "name")
                 label     = "BugReport" if issue_type.lower() in ("bug", "incident", "defect") else "Ticket"
 
-                _merge_node(session, "Ticket", key, {
+                ticket_rows.append({
+                    "node_id":    key,
                     "project":    project,
                     "summary":    fields.get("summary", "")[:1000],
                     "text":       desc_text[:4000],
@@ -491,7 +588,8 @@ def ingest_tickets(
 
                 # Also create a BugReport node for bug-type issues
                 if label == "BugReport":
-                    _merge_node(session, "BugReport", f"bug:{key}", {
+                    bug_rows.append({
+                        "node_id":     f"bug:{key}",
                         "ticket_ref":  key,
                         "title":       fields.get("summary", "")[:500],
                         "summary":     desc_text[:2000],
@@ -500,9 +598,18 @@ def ingest_tickets(
                         "reported_at": fields.get("created", ""),
                     })
                     # BugReport -[REFERENCES]-> Ticket
-                    _merge_rel(session, f"bug:{key}", "BugReport", "REFERENCES", key, "Ticket")
+                    bug_ticket_pairs.append((f"bug:{key}", key))
 
                 inserted += 1
+
+            # PERF: was one _merge_node() call per Ticket + one per
+            # BugReport + one _merge_rel() per bug->ticket edge per page
+            # (up to 3*len(issues) MERGE round trips per page). Same node
+            # ids/props and same BugReport-[REFERENCES]->Ticket edges,
+            # batched via UNWIND -- 3 round trips per page instead.
+            _merge_nodes_batch(session, "Ticket", ticket_rows)
+            _merge_nodes_batch(session, "BugReport", bug_rows)
+            _merge_rels_batch(session, "BugReport", "REFERENCES", "Ticket", bug_ticket_pairs)
 
         start_at += len(issues)
         next_page_token = data.get("nextPageToken")
@@ -578,6 +685,9 @@ def ingest_messages(
 
             inserted = 0
             with driver.session(database=_db(driver)) as session:
+                node_rows: list[dict] = []
+                edge_specs: list[tuple[str, list[str], list[str]]] = []
+
                 for msg in local["messages"]:
                     ts = msg.get("ts")
                     if not ts:
@@ -591,7 +701,8 @@ def ingest_messages(
                         # instead of Slack's raw epoch `ts` string.
                         timestamp = str(ts)
 
-                    _merge_node(session, "SlackMessage", msg_id, {
+                    node_rows.append({
+                        "node_id":      msg_id,
                         "channel_id":   local_channel_id,
                         "channel_name": local_channel_name,
                         "user_id":      msg.get("user", ""),
@@ -600,15 +711,26 @@ def ingest_messages(
                         "timestamp":    timestamp,
                         "thread_ts":    msg.get("thread_ts", ""),
                     })
-                    inserted += 1
+                    edge_specs.append((msg_id, msg.get("commits", []) or [], msg.get("tickets", []) or []))
 
-                    # Same directness trick as ingest_tickets' local path: if
-                    # the file states exactly which commits/tickets a message
-                    # discusses, wire DISCUSSED_IN here instead of leaving it
-                    # to build_edges()'s regex/keyword match, which silently
-                    # produces zero edges for messages that don't happen to
-                    # contain a literal ticket key or full commit sha.
-                    for sha in msg.get("commits", []) or []:
+                inserted = len(node_rows)
+                # PERF: was one _merge_node() call per message (N MERGE
+                # round trips). Same node ids/props, batched via UNWIND.
+                _merge_nodes_batch(session, "SlackMessage", node_rows)
+
+                # Same directness trick as ingest_tickets' local path: if
+                # the file states exactly which commits/tickets a message
+                # discusses, wire DISCUSSED_IN here instead of leaving it
+                # to build_edges()'s regex/keyword match, which silently
+                # produces zero edges for messages that don't happen to
+                # contain a literal ticket key or full commit sha.
+                # NOTE: the commit-sha edge is a STARTS WITH prefix match
+                # (same reason as ingest_tickets' local path above), so it
+                # isn't a fit for the generic exact-id _merge_rels_batch
+                # helper -- left as its own per-message loop, run after
+                # the SlackMessage nodes it depends on already exist.
+                for msg_id, shas, ticket_keys in edge_specs:
+                    for sha in shas:
                         result = session.run(
                             """
                             MATCH (a:SlackMessage {id: $msg_id})
@@ -620,7 +742,7 @@ def ingest_messages(
                         )
                         if result.single()["merged"]:
                             log.info("  SlackMessage %s -[DISCUSSED_IN]-> Commit (sha=%s) via local file.", msg_id, sha)
-                    for key in msg.get("tickets", []) or []:
+                    for key in ticket_keys:
                         result = session.run(
                             """
                             MATCH (a:SlackMessage {id: $msg_id})
@@ -676,11 +798,13 @@ def ingest_messages(
             break
 
         with driver.session(database=_db(driver)) as session:
+            node_rows: list[dict] = []
             for msg in data.get("messages", []):
                 msg_id = f"{channel_id}:{msg['ts']}"
                 ts_dt  = datetime.fromtimestamp(float(msg.get("ts", 0)), tz=timezone.utc)
 
-                _merge_node(session, "SlackMessage", msg_id, {
+                node_rows.append({
+                    "node_id":      msg_id,
                     "channel_id":   channel_id,
                     "channel_name": channel_name,
                     "user_id":      msg.get("user", ""),
@@ -689,7 +813,10 @@ def ingest_messages(
                     "timestamp":    ts_dt.isoformat(),
                     "thread_ts":    msg.get("thread_ts", ""),
                 })
-                inserted += 1
+            # PERF: was one _merge_node() call per message per page (N
+            # MERGE round trips). Same node ids/props, batched via UNWIND.
+            _merge_nodes_batch(session, "SlackMessage", node_rows)
+            inserted += len(node_rows)
 
         meta   = data.get("response_metadata", {})
         cursor = meta.get("next_cursor")
