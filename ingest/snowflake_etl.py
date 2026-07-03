@@ -72,6 +72,67 @@ def _exe(cur, sql: str, params=None):
 
 
 # ---------------------------------------------------------------------------
+# PERF: bulk upsert helper — replaces "one MERGE statement per row" with
+# "N bulk-bound inserts into a TEMPORARY staging table (1 round trip) + one
+# MERGE against it (1 round trip)". Same ON/WHEN MATCHED/WHEN NOT MATCHED
+# semantics as the row-by-row MERGE it replaces; same target-table columns
+# and values end up written, just via 2 statements total instead of N.
+#
+# Snowflake's connector only bulk-optimizes executemany() for plain INSERT
+# statements (stage-bound, single round trip) -- MERGE isn't covered by
+# that optimization, so executemany() on a MERGE directly would still be
+# N round trips. Staging through a TEMPORARY table (session-scoped, auto
+# dropped on connection close, and explicitly dropped in `finally` here
+# too) is what actually turns this into O(1) round trips regardless of N.
+# ---------------------------------------------------------------------------
+
+def _bulk_merge(conn, table: str, columns: list[str], pk_col: str, rows: list[tuple]) -> int:
+    """Upsert `rows` into `table` in one MERGE instead of one MERGE per row.
+
+    `columns` is the exact ordered list of column identifiers each row
+    tuple maps to -- same order, same quoting/casing the table's DDL uses
+    (e.g. '"BRANCH"' for COMMITS, since that column is a quoted identifier
+    in the original schema). `pk_col` is the column MERGE matches ON, and
+    must also appear in `columns`. Returns the row count passed in (rows
+    is always fully applied or the MERGE raises -- same all-or-nothing
+    per-call behavior as the row-by-row version had per-row, just now
+    atomic for the whole batch instead of partial-on-error).
+    """
+    if not rows:
+        return 0
+
+    stage = f"_stage_{table}_{os.getpid()}"
+    cur = conn.cursor()
+    try:
+        cur.execute(f"CREATE TEMPORARY TABLE {stage} LIKE {table}")
+
+        col_list = ", ".join(columns)
+        placeholders = ", ".join(["%s"] * len(columns))
+        cur.executemany(
+            f"INSERT INTO {stage} ({col_list}) VALUES ({placeholders})", rows
+        )
+
+        update_cols = [c for c in columns if c != pk_col]
+        set_clause = ", ".join(f"{c}=src.{c}" for c in update_cols)
+        values_clause = ", ".join(f"src.{c}" for c in columns)
+        cur.execute(f"""
+            MERGE INTO {table} AS tgt
+            USING {stage} AS src
+            ON tgt.{pk_col} = src.{pk_col}
+            WHEN MATCHED THEN UPDATE SET {set_clause}
+            WHEN NOT MATCHED THEN INSERT ({col_list})
+            VALUES ({values_clause})
+        """)
+        return len(rows)
+    finally:
+        try:
+            cur.execute(f"DROP TABLE IF EXISTS {stage}")
+        except Exception:
+            pass
+        cur.close()
+
+
+# ---------------------------------------------------------------------------
 # Schema drift check — code's DDL/MERGE statements assume these columns
 # exist with a roughly-compatible type. CREATE TABLE IF NOT EXISTS silently
 # no-ops on tables that already exist (wrong type, missing column, both),
@@ -445,15 +506,28 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
 
     log.info("  %d unique commits fetched across all branches; enriching with diff stats...", len(commits_by_sha))
 
-    rows: list[tuple] = []
-    for sha, entry in commits_by_sha.items():
-        c           = entry["commit"]
-        commit_branch = entry["branch"]
-        commit_data = c.get("commit", {})
-        author_data = commit_data.get("author") or {}
-        message     = commit_data.get("message", "")
+    # PERF: diff-stat detail fetch is one independent GitHub API call per
+    # commit (no shared state, no ordering dependency -- rows are bulk
+    # MERGEd into Snowflake by primary key afterward, so row order doesn't
+    # matter). Running these serially made this loop O(N) sequential round
+    # trips (N = unique commits, up to max_pages*100 per branch), which
+    # dominated ingest wall-clock for any repo with a few hundred+ commits.
+    # A bounded thread pool overlaps the network waits; worker count capped
+    # at 20 to stay well under GitHub's secondary rate-limit burst ceiling.
+    # Same per-commit try/except fallback (additions=deletions=files=0,
+    # empty patch_summary) is preserved exactly, just per-future instead of
+    # per-loop-iteration -- a failed/rate-limited detail fetch degrades a
+    # single commit's row the same way it did before, it never aborts the
+    # batch.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        # Fetch diff stats per commit
+    def _fetch_commit_row(sha: str, entry: dict) -> tuple:
+        c             = entry["commit"]
+        commit_branch = entry["branch"]
+        commit_data   = c.get("commit", {})
+        author_data   = commit_data.get("author") or {}
+        message       = commit_data.get("message", "")
+
         additions = deletions = files_changed = 0
         patch_summary = ""
         try:
@@ -473,7 +547,7 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
         except Exception:
             pass
 
-        rows.append((
+        return (
             sha,
             repo,
             commit_branch,
@@ -486,40 +560,36 @@ def ingest_commits(repo: str, branch: str = "main", max_pages: int = 10) -> None
             deletions,
             patch_summary,
             c.get("html_url", ""),
-        ))
+        )
+
+    rows: list[tuple] = []
+    max_workers = min(20, len(commits_by_sha)) or 1
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_fetch_commit_row, sha, entry): sha
+            for sha, entry in commits_by_sha.items()
+        }
+        for fut in as_completed(futures):
+            rows.append(fut.result())
 
     conn = _get_conn()
-    cur = conn.cursor()
     try:
-        merge_sql = """
-        MERGE INTO COMMITS AS tgt
-        USING (SELECT %s AS commit_id, %s AS repo, %s AS "BRANCH",
-                      %s AS author, %s AS author_email, %s AS message,
-                      %s AS timestamp, %s AS files_changed,
-                      %s AS additions, %s AS deletions,
-                      %s AS patch_summary, %s AS url) AS src
-        ON tgt.commit_id = src.commit_id
-        WHEN MATCHED THEN UPDATE SET
-            repo=src.repo, "BRANCH"=src."BRANCH", author=src.author,
-            author_email=src.author_email, message=src.message,
-            timestamp=src.timestamp, files_changed=src.files_changed,
-            additions=src.additions, deletions=src.deletions,
-            patch_summary=src.patch_summary, url=src.url
-        WHEN NOT MATCHED THEN INSERT
-            (commit_id, repo, "BRANCH", author, author_email, message, timestamp,
-             files_changed, additions, deletions, patch_summary, url)
-        VALUES
-            (src.commit_id, src.repo, src."BRANCH", src.author, src.author_email,
-             src.message, src.timestamp, src.files_changed, src.additions,
-             src.deletions, src.patch_summary, src.url)
-        """
-        upserted = 0
-        for row in rows:
-            cur.execute(merge_sql, row)
-            upserted += 1
-        log.info("  Upserted %d/%d commits.", upserted, len(rows))
+        # PERF: was one `cur.execute(merge_sql, row)` per commit (N MERGE
+        # round trips). _bulk_merge stages all rows into a TEMPORARY table
+        # via one bulk-bound INSERT, then runs exactly one MERGE with the
+        # identical ON/WHEN MATCHED/WHEN NOT MATCHED clauses that were
+        # spelled out inline below before -- same target columns, same
+        # update-vs-insert semantics, same COMMITS rows end up written.
+        _bulk_merge(
+            conn, "COMMITS",
+            columns=["commit_id", "repo", '"BRANCH"', "author", "author_email",
+                     "message", "timestamp", "files_changed", "additions",
+                     "deletions", "patch_summary", "url"],
+            pk_col="commit_id",
+            rows=rows,
+        )
+        log.info("  Upserted %d/%d commits.", len(rows), len(rows))
     finally:
-        cur.close()
         conn.close()
     log.info("ETL done.")
 
