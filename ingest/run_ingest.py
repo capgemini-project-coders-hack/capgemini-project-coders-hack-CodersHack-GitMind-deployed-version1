@@ -43,7 +43,7 @@ def _first(csv_env: str) -> str:
     return parts[0] if parts else ""
 
 
-def _run_step(label: str, fn, argv: list[str]) -> int:
+def _run_step(label: str, fn, argv: list[str], cache: dict | None = None) -> int:
     """Run one ETL CLI invocation, catching anything it raises.
 
     Neither snowflake_etl.main() nor neo4j_etl.main() catch exceptions
@@ -56,7 +56,7 @@ def _run_step(label: str, fn, argv: list[str]) -> int:
     """
     log.info("=== %s ===", label)
     try:
-        rc = fn(argv)
+        rc = fn(argv, cache=cache)
         if rc:
             log.error("%s exited with code %s", label, rc)
         return rc or 0
@@ -103,26 +103,37 @@ def run(
 
     overall_rc = 0
 
+    # PERF: single run-scoped cache shared by both pipelines below. Both
+    # snowflake_etl and neo4j_etl fetch the exact same GitHub branch list,
+    # commit pages, ADR listing/content, jira/issues.json probe, and (when
+    # applicable) the same live Jira/Slack pages for this repo/branch/
+    # project/channel -- passing the same dict into both `main()` calls
+    # means whichever pipeline runs second reads already-fetched payloads
+    # back out instead of hitting the network again. Created fresh here on
+    # every run() call and discarded when it returns -- not persisted.
+    from ingest.fetch_cache import new_cache
+    cache = new_cache()
+
     # --- Snowflake -----------------------------------------------------
     from ingest import snowflake_etl
 
-    overall_rc |= _run_step("Snowflake ETL: ddl", snowflake_etl.main, ["--step", "ddl"])
-    overall_rc |= _run_step("Snowflake ETL: commits", snowflake_etl.main, ["--step", "commits", *base_args])
-    overall_rc |= _run_step("Snowflake ETL: tickets", snowflake_etl.main, ["--step", "tickets", *base_args])
+    overall_rc |= _run_step("Snowflake ETL: ddl", snowflake_etl.main, ["--step", "ddl"], cache=cache)
+    overall_rc |= _run_step("Snowflake ETL: commits", snowflake_etl.main, ["--step", "commits", *base_args], cache=cache)
+    overall_rc |= _run_step("Snowflake ETL: tickets", snowflake_etl.main, ["--step", "tickets", *base_args], cache=cache)
     if channel:
-        overall_rc |= _run_step("Snowflake ETL: messages", snowflake_etl.main, ["--step", "messages", "--channel", channel])
-    overall_rc |= _run_step("Snowflake ETL: adrs", snowflake_etl.main, ["--step", "adrs", *base_args])
+        overall_rc |= _run_step("Snowflake ETL: messages", snowflake_etl.main, ["--step", "messages", "--channel", channel], cache=cache)
+    overall_rc |= _run_step("Snowflake ETL: adrs", snowflake_etl.main, ["--step", "adrs", *base_args], cache=cache)
 
     # --- Neo4j -----------------------------------------------------------
     from ingest import neo4j_etl
 
-    overall_rc |= _run_step("Neo4j ETL: constraints", neo4j_etl.main, ["--step", "constraints"])
-    overall_rc |= _run_step("Neo4j ETL: commits", neo4j_etl.main, ["--step", "commits", *base_args])
-    overall_rc |= _run_step("Neo4j ETL: tickets", neo4j_etl.main, ["--step", "tickets", *base_args])
+    overall_rc |= _run_step("Neo4j ETL: constraints", neo4j_etl.main, ["--step", "constraints"], cache=cache)
+    overall_rc |= _run_step("Neo4j ETL: commits", neo4j_etl.main, ["--step", "commits", *base_args], cache=cache)
+    overall_rc |= _run_step("Neo4j ETL: tickets", neo4j_etl.main, ["--step", "tickets", *base_args], cache=cache)
     if channel:
-        overall_rc |= _run_step("Neo4j ETL: messages", neo4j_etl.main, ["--step", "messages", "--channel", channel])
-    overall_rc |= _run_step("Neo4j ETL: adrs", neo4j_etl.main, ["--step", "adrs", *base_args])
-    overall_rc |= _run_step("Neo4j ETL: edges", neo4j_etl.main, ["--step", "edges"])
+        overall_rc |= _run_step("Neo4j ETL: messages", neo4j_etl.main, ["--step", "messages", "--channel", channel], cache=cache)
+    overall_rc |= _run_step("Neo4j ETL: adrs", neo4j_etl.main, ["--step", "adrs", *base_args], cache=cache)
+    overall_rc |= _run_step("Neo4j ETL: edges", neo4j_etl.main, ["--step", "edges"], cache=cache)
 
     if overall_rc:
         log.error("One or more ETL steps failed — see logs above for which ones. Exiting non-zero.")
