@@ -236,7 +236,7 @@ def _merge_nodes_batch(session, label: str, rows: list[dict], batch_size: int = 
 
 
 def _merge_rels_batch(session, from_label: str, rel: str, to_label: str,
-                       pairs: list[tuple[str, str]], batch_size: int = 500) -> None:
+                       pairs: list[tuple[str, str]], batch_size: int = 500) -> int:
     """Batch MERGE for (from_label)-[rel]->(to_label) edges, matched by id.
 
     `pairs` is a list of (from_id, to_id) tuples -- same MATCH-by-id +
@@ -244,18 +244,55 @@ def _merge_rels_batch(session, from_label: str, rel: str, to_label: str,
     just batched. Edges with props aren't covered here since none of the
     batch-eligible call sites use them (props=None in every case this
     replaces).
+
+    PERF #8: now returns the total relationships_created count across all
+    chunks. Existing callers ignored the return value before, so this is
+    backward compatible; build_edges()'s regex->indexed-lookup rewrite
+    uses it to keep its "%d edge(s) created" log lines accurate.
     """
     if not pairs:
-        return
+        return 0
     cypher = f"""
         UNWIND $pairs AS pair
         MATCH (a:{from_label} {{id: pair[0]}})
         MATCH (b:{to_label}   {{id: pair[1]}})
         MERGE (a)-[r:{rel}]->(b)
     """
+    created = 0
     for i in range(0, len(pairs), batch_size):
         chunk = pairs[i:i + batch_size]
-        session.run(cypher, pairs=[[f, t] for f, t in chunk])
+        result = session.run(cypher, pairs=[[f, t] for f, t in chunk])
+        created += result.consume().counters.relationships_created
+    return created
+
+
+def _merge_rels_batch_prefix(session, from_label: str, rel: str, to_label: str,
+                              pairs: list[tuple[str, str]], batch_size: int = 500) -> int:
+    """Same contract as _merge_rels_batch, except the `to` side is matched
+    with STARTS WITH instead of exact id equality.
+
+    Used for the one edge type where the mentioned string is a *prefix*
+    of the stored id rather than the full id (SlackMessage mentioning a
+    short 7-char commit SHA while Commit.id stores the full 40-char sha).
+    STARTS WITH on a uniqueness-constraint-backed range index is still an
+    indexed prefix seek, not a scan -- the same trick already used for
+    the jira/issues.json `commits[]` -> Ticket linking in ingest_tickets().
+    """
+    if not pairs:
+        return 0
+    cypher = f"""
+        UNWIND $pairs AS pair
+        MATCH (a:{from_label} {{id: pair[0]}})
+        MATCH (b:{to_label})
+        WHERE b.id STARTS WITH pair[1]
+        MERGE (a)-[r:{rel}]->(b)
+    """
+    created = 0
+    for i in range(0, len(pairs), batch_size):
+        chunk = pairs[i:i + batch_size]
+        result = session.run(cypher, pairs=[[f, t] for f, t in chunk])
+        created += result.consume().counters.relationships_created
+    return created
 
 
 # ---------------------------------------------------------------------------
@@ -1141,6 +1178,59 @@ def ingest_decisions_from_file(driver, path: str) -> None:
 # Step 7: Wire edges
 # ---------------------------------------------------------------------------
 
+# PERF #8: extraction regexes used to pull candidate ticket-keys / commit
+# SHAs out of free text *once per source row*, client-side, instead of
+# asking Neo4j to regex-scan every row of one label against every row of
+# another (see build_edges() below). Same ticket-key shape as the
+# existing `_TICKET_KEY_RE` (module-level, defined further down for
+# synthesize_decisions_from_adrs()), but case-insensitive at the regex
+# level since commit/Slack text may reference a key in lowercase (e.g.
+# "fixed proj-123") the way the original `(?i)` Cypher regex did; matches
+# are upper-cased before use as a lookup key so they still line up with
+# Ticket.id, which Jira always returns upper-cased.
+_TICKET_MENTION_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]+-\d{1,5}\b")
+
+# Candidate git-SHA-shaped hex tokens (7-40 hex chars) in free text.
+_SHA_MENTION_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+
+
+def _extract_id_ref_pairs(rows: list[dict], text_field: str, id_field: str = "id") -> list[tuple[str, str]]:
+    """Scan `text_field` on each row exactly once for ticket-key-shaped
+    tokens and return deduped (row_id, TICKET_KEY) pairs.
+
+    Replaces an O(|Ticket| * |rows|) in-database regex scan with
+    O(|rows|) Python extraction; the caller then MERGEs the resulting
+    pairs by matching both sides on exact id (indexed).
+    """
+    pairs: set[tuple[str, str]] = set()
+    for row in rows:
+        text = row.get(text_field)
+        if not text:
+            continue
+        for m in _TICKET_MENTION_RE.finditer(text):
+            pairs.add((row[id_field], m.group(0).upper()))
+    return sorted(pairs)
+
+
+def _extract_sha_ref_pairs(rows: list[dict], text_field: str, id_field: str = "id") -> list[tuple[str, str]]:
+    """Same idea as _extract_id_ref_pairs but for commit-SHA mentions:
+    pulls every 7-40 char hex token out of `text_field` once per row.
+
+    The resulting (row_id, sha_fragment) pairs are matched against
+    Commit.id with STARTS WITH via _merge_rels_batch_prefix, since git
+    SHAs are stored full-length (40 chars) but usually mentioned in
+    short 7-char form.
+    """
+    pairs: set[tuple[str, str]] = set()
+    for row in rows:
+        text = row.get(text_field)
+        if not text:
+            continue
+        for m in _SHA_MENTION_RE.finditer(text):
+            pairs.add((row[id_field], m.group(0).lower()))
+    return sorted(pairs)
+
+
 def build_edges(driver) -> None:
     """
     Infer relationships between existing nodes from shared identifiers
@@ -1151,21 +1241,26 @@ def build_edges(driver) -> None:
     with driver.session(database=_db(driver)) as session:
 
         # Commit message references a Jira ticket  → Commit -[REFERENCES]-> Ticket
-        # Regex match can't use an index seek like the equality joins above,
-        # but correlating Commit inside a scoped subquery per Ticket row
-        # (rather than an open `MATCH (c),(t)`) still avoids the cartesian
-        # product notification, since Neo4j can plan it as a per-row nested
-        # loop against a bound `t` instead of a full cross join.
-        result = session.run("""
-            MATCH (t:Ticket)
-            CALL (t) {
-                MATCH (c:Commit)
-                WHERE c.message =~ ('(?i).*' + t.id + '.*')
-                  AND NOT (c)-[:REFERENCES]->(t)
-                MERGE (c)-[:REFERENCES]->(t)
-            }
-        """)
-        merged = result.consume().counters.relationships_created
+        # PERF #8: was `MATCH (t:Ticket) CALL(t){ MATCH (c:Commit) WHERE
+        # c.message =~ ('(?i).*'+t.id+'.*') ... }` -- an in-database regex
+        # evaluated once per (Ticket, Commit) pair, O(|Ticket| * |Commit|).
+        # The `CALL(t){}` scoping avoided the cartesian-product *warning*
+        # but not the actual nested-loop cost: regex against free text
+        # can't use a range index, so every Ticket forced a full rescan of
+        # every Commit's message.
+        #
+        # Rewritten to read each Commit's message exactly once and extract
+        # ticket-key-shaped tokens client-side (O(|Commit|) total), then
+        # MERGE the resulting pairs with a batched UNWIND that MATCHes
+        # both sides by exact id -- an indexed seek on the existing
+        # Commit.id / Ticket.id uniqueness-constraint indexes instead of a
+        # scan-and-regex. No schema change needed: those indexes already
+        # exist (see CONSTRAINTS above).
+        commit_rows = _run(session,
+            "MATCH (c:Commit) WHERE c.message IS NOT NULL AND c.message <> '' "
+            "RETURN c.id AS id, c.message AS message")
+        commit_ticket_pairs = _extract_id_ref_pairs(commit_rows, "message")
+        merged = _merge_rels_batch(session, "Commit", "REFERENCES", "Ticket", commit_ticket_pairs)
         log.info("  Commit -[REFERENCES]-> Ticket: %d edge(s) created", merged)
 
         # BugReport references a commit  → BugReport -[CAUSED_BY]-> Commit
@@ -1256,33 +1351,34 @@ def build_edges(driver) -> None:
         log.info("  ADR -[REFERENCES]-> Commit: %d edge(s) created (keyword match)", merged)
 
         # SlackMessage discusses a Ticket  → SlackMessage -[DISCUSSED_IN]-> Ticket
-        # Slack has no connection in this deployment (no SLACK_BOT_TOKEN),
-        # so SlackMessage will have 0 rows and this MATCH is a no-op — but
-        # it's kept correlated/indexable rather than an open cartesian join
-        # so it's cheap now and correct the moment Slack is connected.
-        result = session.run("""
-            MATCH (t:Ticket)
-            CALL (t) {
-                MATCH (m:SlackMessage)
-                WHERE m.text =~ ('(?i).*' + t.id + '.*')
-                  AND NOT (m)-[:DISCUSSED_IN]->(t)
-                MERGE (m)-[:DISCUSSED_IN]->(t)
-            }
-        """)
-        merged = result.consume().counters.relationships_created
+        # SlackMessage discusses a Commit (SHA mention)
+        # PERF #8: previously TWO independent O(|Ticket|*|Slack|) and
+        # O(|Commit|*|Slack|) in-database regex scans, each rescanning
+        # every SlackMessage's text from scratch (once per Ticket, again
+        # once per Commit). Slack has no connection in this deployment
+        # (no SLACK_BOT_TOKEN) so SlackMessage is 0 rows today and this
+        # was a cheap no-op either way, but it's rewritten so it stays
+        # cheap the moment Slack is connected and message volume grows.
+        #
+        # Rewritten to read every SlackMessage's text exactly ONCE
+        # (O(|Slack|) total, shared by both extractions below) and pull
+        # both ticket-key and SHA-fragment candidates out of that single
+        # read client-side. Ticket edges MERGE via exact-id indexed
+        # lookup (_merge_rels_batch); Commit edges MERGE via STARTS WITH
+        # indexed prefix lookup (_merge_rels_batch_prefix), since Slack
+        # mentions the short 7-char SHA while Commit.id stores the full
+        # 40-char SHA -- same as the original `left(c.id, 7)` comparison,
+        # just index-eligible instead of a regex predicate.
+        slack_rows = _run(session,
+            "MATCH (m:SlackMessage) WHERE m.text IS NOT NULL AND m.text <> '' "
+            "RETURN m.id AS id, m.text AS text")
+
+        slack_ticket_pairs = _extract_id_ref_pairs(slack_rows, "text")
+        merged = _merge_rels_batch(session, "SlackMessage", "DISCUSSED_IN", "Ticket", slack_ticket_pairs)
         log.info("  SlackMessage -[DISCUSSED_IN]-> Ticket: %d edge(s) created", merged)
 
-        # SlackMessage discusses a Commit (SHA mention)
-        result = session.run("""
-            MATCH (c:Commit)
-            CALL (c) {
-                MATCH (m:SlackMessage)
-                WHERE m.text =~ ('(?i).*' + left(c.id, 7) + '.*')
-                  AND NOT (m)-[:DISCUSSED_IN]->(c)
-                MERGE (m)-[:DISCUSSED_IN]->(c)
-            }
-        """)
-        merged = result.consume().counters.relationships_created
+        slack_commit_pairs = _extract_sha_ref_pairs(slack_rows, "text")
+        merged = _merge_rels_batch_prefix(session, "SlackMessage", "DISCUSSED_IN", "Commit", slack_commit_pairs)
         log.info("  SlackMessage -[DISCUSSED_IN]-> Commit: %d edge(s) created", merged)
 
     log.info("Edge building complete.")
