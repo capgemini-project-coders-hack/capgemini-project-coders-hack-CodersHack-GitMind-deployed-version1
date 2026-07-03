@@ -32,9 +32,53 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gitmind.ingest")
+
+
+class _LockedCache:
+    """Thin dict-like proxy that serializes check-then-act cache access.
+
+    OPT#6: snowflake_etl.py / neo4j_etl.py both do
+    `if key in cache: ... else: fetch(); cache[key] = data` at ~10 call
+    sites. That pattern is check-then-act, not atomic. CPython's GIL makes
+    each individual `in` / `[]` / `[]=` call atomic in isolation, so a race
+    here can never corrupt the underlying dict -- the only real effect of
+    two threads missing the same key at once is a redundant network fetch,
+    immediately followed by a harmless overwrite with equivalent data
+    (both threads are fetching the *same* GitHub/Jira/Slack resource for
+    the same repo/branch/channel).
+
+    So this lock is not required for correctness. It exists to close that
+    redundant-fetch window: Snowflake ETL and Neo4j ETL now start at the
+    same instant (see run(), below), which is exactly the moment they're
+    most likely to race on a cold cache -- and every avoided duplicate
+    call is one less hit against GitHub's rate limit. Held only across a
+    single get/contains/set, never across the fetch+set span, so it never
+    serializes the actual network I/O -- both pipelines can still fetch
+    different resources fully in parallel.
+    """
+
+    __slots__ = ("_d", "_lock")
+
+    def __init__(self) -> None:
+        self._d: dict = {}
+        self._lock = threading.Lock()
+
+    def __contains__(self, key) -> bool:
+        with self._lock:
+            return key in self._d
+
+    def __getitem__(self, key):
+        with self._lock:
+            return self._d[key]
+
+    def __setitem__(self, key, value) -> None:
+        with self._lock:
+            self._d[key] = value
 
 
 def _first(csv_env: str) -> str:
@@ -101,39 +145,50 @@ def run(
     if project:
         base_args += ["--project", project]
 
-    overall_rc = 0
+    cache = _LockedCache()
 
-    # PERF: single run-scoped cache shared by both pipelines below. Both
-    # snowflake_etl and neo4j_etl fetch the exact same GitHub branch list,
-    # commit pages, ADR listing/content, jira/issues.json probe, and (when
-    # applicable) the same live Jira/Slack pages for this repo/branch/
-    # project/channel -- passing the same dict into both `main()` calls
-    # means whichever pipeline runs second reads already-fetched payloads
-    # back out instead of hitting the network again. Created fresh here on
-    # every run() call and discarded when it returns -- not persisted.
-    from ingest.fetch_cache import new_cache
-    cache = new_cache()
+    def _snowflake_pipeline() -> int:
+        from ingest import snowflake_etl
 
-    # --- Snowflake -----------------------------------------------------
-    from ingest import snowflake_etl
+        rc = 0
+        rc |= _run_step("Snowflake ETL: ddl", snowflake_etl.main, ["--step", "ddl"], cache=cache)
+        rc |= _run_step("Snowflake ETL: commits", snowflake_etl.main, ["--step", "commits", *base_args], cache=cache)
+        rc |= _run_step("Snowflake ETL: tickets", snowflake_etl.main, ["--step", "tickets", *base_args], cache=cache)
+        if channel:
+            rc |= _run_step("Snowflake ETL: messages", snowflake_etl.main, ["--step", "messages", "--channel", channel], cache=cache)
+        rc |= _run_step("Snowflake ETL: adrs", snowflake_etl.main, ["--step", "adrs", *base_args], cache=cache)
+        return rc
 
-    overall_rc |= _run_step("Snowflake ETL: ddl", snowflake_etl.main, ["--step", "ddl"], cache=cache)
-    overall_rc |= _run_step("Snowflake ETL: commits", snowflake_etl.main, ["--step", "commits", *base_args], cache=cache)
-    overall_rc |= _run_step("Snowflake ETL: tickets", snowflake_etl.main, ["--step", "tickets", *base_args], cache=cache)
-    if channel:
-        overall_rc |= _run_step("Snowflake ETL: messages", snowflake_etl.main, ["--step", "messages", "--channel", channel], cache=cache)
-    overall_rc |= _run_step("Snowflake ETL: adrs", snowflake_etl.main, ["--step", "adrs", *base_args], cache=cache)
+    def _neo4j_pipeline() -> int:
+        from ingest import neo4j_etl
 
-    # --- Neo4j -----------------------------------------------------------
-    from ingest import neo4j_etl
+        rc = 0
+        rc |= _run_step("Neo4j ETL: constraints", neo4j_etl.main, ["--step", "constraints"], cache=cache)
+        rc |= _run_step("Neo4j ETL: commits", neo4j_etl.main, ["--step", "commits", *base_args], cache=cache)
+        rc |= _run_step("Neo4j ETL: tickets", neo4j_etl.main, ["--step", "tickets", *base_args], cache=cache)
+        if channel:
+            rc |= _run_step("Neo4j ETL: messages", neo4j_etl.main, ["--step", "messages", "--channel", channel], cache=cache)
+        rc |= _run_step("Neo4j ETL: adrs", neo4j_etl.main, ["--step", "adrs", *base_args], cache=cache)
+        rc |= _run_step("Neo4j ETL: edges", neo4j_etl.main, ["--step", "edges"], cache=cache)
+        return rc
 
-    overall_rc |= _run_step("Neo4j ETL: constraints", neo4j_etl.main, ["--step", "constraints"], cache=cache)
-    overall_rc |= _run_step("Neo4j ETL: commits", neo4j_etl.main, ["--step", "commits", *base_args], cache=cache)
-    overall_rc |= _run_step("Neo4j ETL: tickets", neo4j_etl.main, ["--step", "tickets", *base_args], cache=cache)
-    if channel:
-        overall_rc |= _run_step("Neo4j ETL: messages", neo4j_etl.main, ["--step", "messages", "--channel", channel], cache=cache)
-    overall_rc |= _run_step("Neo4j ETL: adrs", neo4j_etl.main, ["--step", "adrs", *base_args], cache=cache)
-    overall_rc |= _run_step("Neo4j ETL: edges", neo4j_etl.main, ["--step", "edges"], cache=cache)
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="gitmind-ingest") as pool:
+        snowflake_future = pool.submit(_snowflake_pipeline)
+        neo4j_future = pool.submit(_neo4j_pipeline)
+
+        try:
+            snowflake_rc = snowflake_future.result()
+        except Exception as exc:  # noqa: BLE001 - isolate, log, keep going
+            log.error("Snowflake pipeline raised an uncaught exception: %s", exc, exc_info=True)
+            snowflake_rc = 1
+
+        try:
+            neo4j_rc = neo4j_future.result()
+        except Exception as exc:  # noqa: BLE001 - isolate, log, keep going
+            log.error("Neo4j pipeline raised an uncaught exception: %s", exc, exc_info=True)
+            neo4j_rc = 1
+
+    overall_rc = snowflake_rc | neo4j_rc
 
     if overall_rc:
         log.error("One or more ETL steps failed — see logs above for which ones. Exiting non-zero.")
