@@ -93,19 +93,18 @@ def check_chain_for_regressions(
         }
 
     try:
-        import google.generativeai as genai
+        from google import genai
     except ImportError:
         return {
             "ran": False,
             "safe": None,
             "violations": [],
             "checked_decisions": 0,
-            "reason": "google-generativeai package not installed — regression check skipped.",
+            "reason": "google-genai package not installed — regression check skipped.",
         }
 
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
     model_name = os.getenv("GITMIND_MODEL", "gemini-2.5-pro")
-    model = genai.GenerativeModel(model_name)
     violations: list[dict[str, str]] = []
 
     # Group by underlying decision identity, not by summary text.
@@ -149,11 +148,12 @@ def check_chain_for_regressions(
         node_ids = [n.get("node_id", "") for n in group_nodes]
 
         try:
-            response = model.generate_content(
-                VIOLATION_PROMPT.format(
+            response = client.models.generate_content(
+                model=model_name,
+                contents=VIOLATION_PROMPT.format(
                     query_summary=query_summary,
                     decision_text=decision_text,
-                )
+                ),
             )
             raw = (response.text or "").strip()
         except Exception as exc:  # network/API errors should not break /query
