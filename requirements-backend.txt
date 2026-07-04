@@ -8,9 +8,13 @@ uvicorn[standard]>=0.22.0
 pydantic>=2.0.0
 
 # LLM / agent (backend/agent/gitmind_agent.py, regression_guard.py)
+# NOTE: google-generativeai was sunset by Google (July 2026) — replaced with
+# the unified google-genai SDK. langchain-google-genai>=4.0.0 already uses
+# google-genai internally, so pin the floor here to avoid pip resolving an
+# old 1.x/2.x/3.x release that still drags in the dead package.
 langchain>=0.2.0
-langchain-google-genai>=1.0.0
-google-generativeai>=0.5.0
+langchain-google-genai>=4.0.0
+google-genai>=1.0.0
 
 # Data sources (backend/graph, backend/snowflake_client.py, backend/utils)
 neo4j>=5.0.0
