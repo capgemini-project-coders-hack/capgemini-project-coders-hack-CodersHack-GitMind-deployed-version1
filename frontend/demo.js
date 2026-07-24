@@ -162,6 +162,13 @@ def analyze_repository(repo_url):
   const timelineBody = document.getElementById("timelineBody");
   const repoExplorer = document.getElementById("repoExplorer");
 
+  const chatMessages = document.getElementById("chatMessages");
+  const chatForm = document.getElementById("chatForm");
+  const chatInput = document.getElementById("chatInput");
+  const chatSendBtn = document.getElementById("chatSendBtn");
+  const EMPTY_CHAT_HTML = chatMessages.innerHTML;
+  const chatHistory = []; // {role: "user"|"bot"|"error", text: string}
+
   const overviewReportBody = document.getElementById("overviewReportBody");
   const motivePromptInput = document.getElementById("motivePromptInput");
   const generateOverviewBtn = document.getElementById("generateOverviewBtn");
@@ -1060,6 +1067,62 @@ def analyze_repository(repo_url):
     }
     setRepoUrlError(null);
     runAnalysis(repoUrlInput.value);
+  });
+
+  // ── Chat (GitMind Q&A over /query) ──────────────────────────────────────
+  function renderChat() {
+    if (chatHistory.length === 0) {
+      chatMessages.innerHTML = EMPTY_CHAT_HTML;
+      return;
+    }
+    chatMessages.innerHTML = chatHistory
+      .map((m) => `<div class="dm-chat-msg dm-chat-msg-${m.role}">${escapeHtml(m.text)}</div>`)
+      .join("");
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+
+  async function sendChatMessage(text) {
+    chatHistory.push({ role: "user", text });
+    chatHistory.push({ role: "loading", text: "Thinking..." });
+    renderChat();
+
+    chatInput.disabled = true;
+    chatSendBtn.disabled = true;
+    chatSendBtn.textContent = "Sending...";
+
+    try {
+      const resp = await postJSON("/query", { query: text }, 45000);
+      const data = await resp.json().catch(() => null);
+
+      chatHistory.pop(); // remove "Thinking..." placeholder
+
+      if (resp.status === 200 && data && typeof data.answer === "string") {
+        chatHistory.push({ role: "bot", text: data.answer });
+      } else {
+        const detail = (data && data.detail) ? data.detail : `Request failed with status ${resp.status}.`;
+        chatHistory.push({ role: "error", text: detail });
+      }
+    } catch (err) {
+      chatHistory.pop(); // remove "Thinking..." placeholder
+      chatHistory.push({
+        role: "error",
+        text: `Request failed: ${err && err.message ? err.message : err}`,
+      });
+    } finally {
+      renderChat();
+      chatInput.disabled = false;
+      chatSendBtn.disabled = false;
+      chatSendBtn.textContent = "Send";
+      chatInput.focus();
+    }
+  }
+
+  chatForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = chatInput.value.trim();
+    if (!text) return;
+    chatInput.value = "";
+    sendChatMessage(text);
   });
 
   // Initial render (empty state)
