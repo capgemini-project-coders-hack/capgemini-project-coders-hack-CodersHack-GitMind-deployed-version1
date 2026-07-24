@@ -214,6 +214,30 @@
       <div class="dm-panel" style="margin-top:20px;">
         <div class="dm-panel-header">
           <div class="dm-panel-icon">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#0070F3" stroke-width="2">
+              <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+            </svg>
+          </div>
+          <span class="dm-panel-title">GitMind Chat</span>
+        </div>
+        <div class="dm-panel-body" style="padding:0;">
+          <div id="chatMessages" class="dm-chat-messages">
+            <div class="dm-empty">
+              <div class="dm-empty-icon">&#128172;</div>
+              <div class="dm-empty-title">Ask GitMind anything</div>
+              <div class="dm-empty-desc">Ask about commits, tickets, ADRs, or trace a root cause. Analyze a repo first for the best answers.</div>
+            </div>
+          </div>
+          <form id="chatForm" class="dm-chat-input-row" autocomplete="off">
+            <input type="text" id="chatInput" class="gm-text-input" placeholder="e.g. Why did auth/middleware.py break?" aria-label="Chat message">
+            <button type="submit" class="gm-btn" id="chatSendBtn">Send</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="dm-panel" style="margin-top:20px;">
+        <div class="dm-panel-header">
+          <div class="dm-panel-icon">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#10B981" stroke-width="2">
               <path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>
             </svg>
