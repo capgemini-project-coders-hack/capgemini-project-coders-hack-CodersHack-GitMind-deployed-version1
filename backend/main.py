@@ -161,6 +161,33 @@ class SnowflakeDetails:
             raise ValueError(f"Unsupported Snowflake table: {table}")
         return self._client.execute(f"SELECT COUNT(*) AS COUNT FROM {table}")
 
+    def build_general_stats_context(self, *, recent_limit: int = 5) -> str:
+        """Snapshot of real counts + a few recent IDs across every known
+        table, formatted as plain text for the LLM's context.
+
+        Used for chit-chat questions with no named entity ("how many
+        commits are there", "what ticket IDs exist") so the agent can
+        answer from real numbers instead of saying it has no info --
+        it previously had no way to see this data at all, since the
+        causal-chain context stays empty when no entity was named.
+        Best-effort: a table that errors (missing/unreachable) is
+        skipped rather than failing the whole chat response.
+        """
+        lines = ["Project-wide stats (live from Snowflake):"]
+        for table, (id_column, order_column) in self._TABLES.items():
+            try:
+                count_rows = self.count(table)
+                total = count_rows[0].get("COUNT") if count_rows else "unknown"
+                recent_rows = self.fetch_summary(table, limit=recent_limit)
+                recent_ids = [str(r.get(id_column, "?")) for r in recent_rows]
+                lines.append(
+                    f"  - {table}: {total} total row(s). "
+                    f"Most recent {id_column}s: {', '.join(recent_ids) or '(none)'}"
+                )
+            except Exception as exc:  # noqa: BLE001 - best-effort per table
+                log.warning("Stats snapshot failed for table %s: %s", table, exc)
+        return "\n".join(lines)
+
 
 # --- Constants & Helpers ---
 
@@ -941,7 +968,10 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
         # is instructed to say so rather than invent an answer -- still
         # honest, but no longer a random table dump.
         try:
-            agent_result = agent_debug(enriched.query, entity_id=enriched.entity_id)
+            stats_context = snowflake.build_general_stats_context()
+            agent_result = agent_debug(
+                enriched.query, entity_id=enriched.entity_id, extra_context=stats_context
+            )
             answer = agent_result.get("root_cause") or f"Returned {len(evidence)} row(s) from {table}."
         except Exception as exc:  # noqa: BLE001 - never let chat fall over
             log.warning("LLM fallback for general chat query failed: %s", exc)
