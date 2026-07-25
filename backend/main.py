@@ -924,11 +924,33 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
             detail=f"Snowflake is unreachable or the query failed: {exc}",
         ) from exc
 
+    # Explicit table/entity/count request -> a raw data dump IS the answer
+    # the caller asked for.
+    if enriched.table or enriched.entity_id or "count" in enriched.query.lower():
+        answer = f"Returned {len(evidence)} row(s) from {table}."
+    else:
+        # Free-text chit-chat with no named entity and no explicit table
+        # request used to fall through to this branch and silently return
+        # "Returned N row(s) from COMMITS" (or whatever infer_table guessed)
+        # as the "answer" -- unrelated to what was actually asked, which is
+        # what read as hallucinated/off-topic in the chat widget. Route
+        # these through the LLM agent instead. With no identifiers to
+        # trace, agent_debug's causal chain comes back empty, so the model
+        # is explicitly told the context is empty (see _AGENT_PROMPT) and
+        # is instructed to say so rather than invent an answer -- still
+        # honest, but no longer a random table dump.
+        try:
+            agent_result = agent_debug(enriched.query, entity_id=enriched.entity_id)
+            answer = agent_result.get("root_cause") or f"Returned {len(evidence)} row(s) from {table}."
+        except Exception as exc:  # noqa: BLE001 - never let chat fall over
+            log.warning("LLM fallback for general chat query failed: %s", exc)
+            answer = f"Returned {len(evidence)} row(s) from {table}."
+
     return GitMindQueryResponse(
         intent=intent,
         route=["Snowflake_Details"],
         evidence=evidence,
-        answer=f"Returned {len(evidence)} row(s) from {table}.",
+        answer=answer,
     )
 
 
