@@ -167,7 +167,7 @@ def analyze_repository(repo_url):
   const chatInput = document.getElementById("chatInput");
   const chatSendBtn = document.getElementById("chatSendBtn");
   const EMPTY_CHAT_HTML = chatMessages.innerHTML;
-  const chatHistory = []; // {role: "user"|"bot"|"error", text: string}
+  const chatHistory = []; // {role: "user"|"bot"|"error"|"loading", text: string}
 
   const overviewReportBody = document.getElementById("overviewReportBody");
   const motivePromptInput = document.getElementById("motivePromptInput");
@@ -415,7 +415,7 @@ def analyze_repository(repo_url):
       const short = repoDisplay.replace("https://github.com/", "");
       statusBox.innerHTML = `
         <div class="dm-status-box dm-status-connected">
-          <div class="dm-status-label-connected">&#9679; Connected</div>
+          <div class="dm-status-label dm-status-label-connected">&#9679; Connected</div>
           <div class="dm-status-repo">${escapeHtml(short)}</div>
         </div>`;
       // Real stats from fetched GitHub data
@@ -436,15 +436,15 @@ def analyze_repository(repo_url):
       const regressions = (state.dm_result && state.dm_result.regression_check && state.dm_result.regression_check.regressions_found) ? state.dm_result.regression_check.regressions_found.length : 0;
       statsBox.innerHTML = `
         <div class="dm-stats-grid">
-          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#003D6B;">${totalCommits}</div><div class="dm-stat-label">Commits</div></div>
-          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#003D6B;">${totalBranches}</div><div class="dm-stat-label">Branches</div></div>
-          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#0070F3;">${issues}</div><div class="dm-stat-label">Issues</div></div>
-          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#10B981;">${regressions}</div><div class="dm-stat-label">Regressions</div></div>
+          <div class="dm-stat-box"><div class="dm-stat-num">${totalCommits}</div><div class="dm-stat-label">Commits</div></div>
+          <div class="dm-stat-box"><div class="dm-stat-num">${totalBranches}</div><div class="dm-stat-label">Branches</div></div>
+          <div class="dm-stat-box"><div class="dm-stat-num">${issues}</div><div class="dm-stat-label">Issues</div></div>
+          <div class="dm-stat-box"><div class="dm-stat-num" style="color:#22C55E;">${regressions}</div><div class="dm-stat-label">Regressions</div></div>
         </div>`;
     } else {
       statusBox.innerHTML = `
         <div class="dm-status-box dm-status-waiting">
-          <div class="dm-status-label-waiting">&#9675; Awaiting Input</div>
+          <div class="dm-status-label dm-status-label-waiting">&#9675; Awaiting Input</div>
           <div class="dm-status-empty">No repository connected</div>
         </div>`;
       statsBox.innerHTML = `<div class="dm-stat-empty">Run an analysis to see graph statistics.</div>`;
@@ -489,7 +489,7 @@ def analyze_repository(repo_url):
     let defs = `
       <defs>
         <marker id="gm-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-          <path d="M0,0 L10,5 L0,10 Z" fill="#94A3B8"></path>
+          <path d="M0,0 L10,5 L0,10 Z" fill="#6B7280"></path>
         </marker>
       </defs>`;
 
@@ -508,10 +508,10 @@ def analyze_repository(repo_url):
       const labelW = rel.length * 5.6 + 12;
       edgesSvg += `
         <line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"
-              stroke="#CBD5E1" stroke-width="1.5" marker-end="url(#gm-arrow)"></line>
+              stroke="#252525" stroke-width="1.5" marker-end="url(#gm-arrow)"></line>
         <g transform="translate(${midX.toFixed(1)},${midY.toFixed(1)}) rotate(${angle.toFixed(1)})">
-          <rect x="${(-labelW / 2).toFixed(1)}" y="-8" width="${labelW.toFixed(1)}" height="16" rx="4" fill="#F8FAFC" stroke="#E2E8F0"></rect>
-          <text x="0" y="3.5" text-anchor="middle" font-size="9" font-weight="600" letter-spacing="0.3" fill="#64748B" font-family="JetBrains Mono, monospace">${rel}</text>
+          <rect x="${(-labelW / 2).toFixed(1)}" y="-8" width="${labelW.toFixed(1)}" height="16" rx="4" fill="#0A0A0A" stroke="#1E1E1E"></rect>
+          <text x="0" y="3.5" text-anchor="middle" font-size="9" font-weight="600" letter-spacing="0.3" fill="#6B7280" font-family="JetBrains Mono, monospace">${rel}</text>
         </g>`;
     }
 
@@ -520,16 +520,16 @@ def analyze_repository(repo_url):
       const initial = escapeHtml(node.label.charAt(0).toUpperCase());
       nodesSvg += `
         <g>
-          <circle cx="${node.x.toFixed(1)}" cy="${node.y.toFixed(1)}" r="${r}" fill="${node.color}" stroke="#fff" stroke-width="3"></circle>
+          <circle cx="${node.x.toFixed(1)}" cy="${node.y.toFixed(1)}" r="${r}" fill="${node.color}" stroke="#0A0A0A" stroke-width="3"></circle>
           <text x="${node.x.toFixed(1)}" y="${(node.y + 4).toFixed(1)}" text-anchor="middle" font-size="15" font-weight="700" fill="#fff" font-family="Inter, sans-serif">${initial}</text>
-          <text x="${node.x.toFixed(1)}" y="${(node.y + r + 16).toFixed(1)}" text-anchor="middle" font-size="11" font-weight="600" fill="#0F172A" font-family="Inter, sans-serif">${escapeHtml(node.label)}</text>
-          <text x="${node.x.toFixed(1)}" y="${(node.y + r + 29).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="#94A3B8" font-family="JetBrains Mono, monospace">${escapeHtml(node.nodeId)}</text>
+          <text x="${node.x.toFixed(1)}" y="${(node.y + r + 16).toFixed(1)}" text-anchor="middle" font-size="11" font-weight="600" fill="#F3F4F6" font-family="Inter, sans-serif">${escapeHtml(node.label)}</text>
+          <text x="${node.x.toFixed(1)}" y="${(node.y + r + 29).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="JetBrains Mono, monospace">${escapeHtml(node.nodeId)}</text>
         </g>`;
     });
 
     return `
-      <div style="margin-top:14px;background:#fff;border:1px solid #E2E8F0;border-radius:8px;overflow-x:auto;">
-        <div style="font-size:11px;color:#94A3B8;padding:10px 14px 0;text-transform:uppercase;letter-spacing:.05em;">Graph View</div>
+      <div style="margin-top:14px;background:#0A0A0A;border:1px solid #1E1E1E;border-radius:16px;overflow-x:auto;">
+        <div style="font-size:11px;color:#6B7280;padding:10px 14px 0;text-transform:uppercase;letter-spacing:.05em;">Graph View</div>
         <svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="display:block;min-width:${width}px;">
           ${defs}
           ${edgesSvg}
@@ -560,21 +560,21 @@ def analyze_repository(repo_url):
 
     if (chain.length > 0) {
       const NODE_COLORS = {
-        Commit: "#0070F3", Function: "#10B981", JiraTicket: "#F59E0B",
-        Ticket: "#F59E0B", SlackMessage: "#8B5CF6", ADR: "#EF4444", Decision: "#EC4899",
+        Commit: "#22D3EE", Function: "#22C55E", JiraTicket: "#FACC15",
+        Ticket: "#FACC15", SlackMessage: "#A78BFA", ADR: "#EF4444", Decision: "#F472B6",
       };
-      let html = `<div style="padding:16px;background:#F8FAFC;border-radius:0 0 8px 8px;min-height:280px;">`;
+      let html = `<div style="padding:16px;background:#030303;border-radius:0 0 16px 16px;min-height:280px;">`;
       chain.forEach((node, i) => {
         const label = node.label || "Node";
         const color = NODE_COLORS[label] || "#64748B";
         const nodeId = node.node_id || String(i);
         const summary = (node.summary || "").slice(0, 60);
         html += `
-          <div style="display:flex;align-items:center;gap:10px;padding:8px 0;${i > 0 ? "border-top:1px dashed #E2E8F0;" : ""}">
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 0;${i > 0 ? "border-top:1px dashed #1E1E1E;" : ""}">
             <div style="width:10px;height:10px;border-radius:50%;background:${color};flex-shrink:0;"></div>
             <div>
-              <div style="font-size:12px;font-weight:600;color:#0F172A;">${escapeHtml(label)} <span style="color:#94A3B8;font-weight:400;">${escapeHtml(nodeId.slice(0,8))}</span></div>
-              <div style="font-size:11px;color:#64748B;">${escapeHtml(summary)}</div>
+              <div style="font-size:12px;font-weight:600;color:#F3F4F6;">${escapeHtml(label)} <span style="color:#6B7280;font-weight:400;">${escapeHtml(nodeId.slice(0,8))}</span></div>
+              <div style="font-size:11px;color:#9CA3AF;">${escapeHtml(summary)}</div>
             </div>
           </div>`;
       });
@@ -584,22 +584,22 @@ def analyze_repository(repo_url):
 
     } else if (ghCommits.length > 0) {
       // Build intent graph from real commits
-      let html = `<div style="padding:16px;background:#F8FAFC;border-radius:0 0 8px 8px;min-height:280px;">
-        <div style="font-size:11px;color:#94A3B8;margin-bottom:10px;text-transform:uppercase;letter-spacing:.05em;">Commit Intent Graph — ${gh.owner}/${gh.repo}</div>`;
+      let html = `<div style="padding:16px;background:#030303;border-radius:0 0 16px 16px;min-height:280px;">
+        <div style="font-size:11px;color:#6B7280;margin-bottom:10px;text-transform:uppercase;letter-spacing:.05em;">Commit Intent Graph — ${gh.owner}/${gh.repo}</div>`;
       ghCommits.forEach((c, i) => {
         const sha = (c.sha || "").slice(0, 8);
         const msg = (c.message || "").split("\n")[0].slice(0, 70);
         const author = c.author || "";
         // Color by conventional commit prefix
         const type = msg.match(/^(feat|fix|chore|refactor|docs|test|style|perf)/i);
-        const colorMap = { feat:"#10B981", fix:"#EF4444", chore:"#94A3B8", refactor:"#F59E0B", docs:"#3B82F6", test:"#8B5CF6", style:"#EC4899", perf:"#F97316" };
-        const color = type ? (colorMap[type[1].toLowerCase()] || "#0070F3") : "#0070F3";
+        const colorMap = { feat:"#22C55E", fix:"#EF4444", chore:"#6B7280", refactor:"#FACC15", docs:"#38BDF8", test:"#A78BFA", style:"#F472B6", perf:"#FB923C" };
+        const color = type ? (colorMap[type[1].toLowerCase()] || "#22D3EE") : "#22D3EE";
         html += `
-          <div style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;${i > 0 ? "border-top:1px dashed #E2E8F0;" : ""}">
+          <div style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;${i > 0 ? "border-top:1px dashed #1E1E1E;" : ""}">
             <div style="width:10px;height:10px;border-radius:50%;background:${color};flex-shrink:0;margin-top:3px;"></div>
             <div>
-              <div style="font-size:12px;font-weight:600;color:#0F172A;font-family:'JetBrains Mono',monospace;">${escapeHtml(sha)}<span style="font-family:inherit;color:#94A3B8;font-weight:400;margin-left:8px;font-size:11px;">${escapeHtml(author)}</span></div>
-              <div style="font-size:11px;color:#334155;margin-top:2px;">${escapeHtml(msg)}</div>
+              <div style="font-size:12px;font-weight:600;color:#F3F4F6;font-family:'JetBrains Mono',monospace;">${escapeHtml(sha)}<span style="font-family:inherit;color:#6B7280;font-weight:400;margin-left:8px;font-size:11px;">${escapeHtml(author)}</span></div>
+              <div style="font-size:11px;color:#9CA3AF;margin-top:2px;">${escapeHtml(msg)}</div>
             </div>
           </div>`;
       });
@@ -678,7 +678,7 @@ def analyze_repository(repo_url):
         });
       } else if (evidence.length > 0) {
         evidence.slice(0, 5).forEach((row) => {
-          html += `<pre style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:6px;padding:10px;font-size:12px;overflow-x:auto;margin-bottom:8px;">${escapeHtml(JSON.stringify(row, null, 2))}</pre>`;
+          html += `<pre style="background:#0A0A0A;border:1px solid #1E1E1E;border-radius:10px;padding:12px;font-size:12px;overflow-x:auto;margin-bottom:8px;color:#9CA3AF;font-family:'JetBrains Mono',monospace;">${escapeHtml(JSON.stringify(row, null, 2))}</pre>`;
         });
       } else {
         html += `<div class="dm-banner-info">No causal chain found for this query.</div>`;
@@ -752,7 +752,7 @@ def analyze_repository(repo_url):
         if (commits.length) {
           let items = "";
           if (picked.fellBack) {
-            items += `<div class="dm-tl-meta" style="margin-bottom:8px;color:#92400E;">⚠ "${escapeHtml(state.dm_selected_branch || "")}" had no commit data — showing "${escapeHtml(branch)}" instead.</div>`;
+            items += `<div class="dm-tl-meta" style="margin-bottom:8px;color:#FACC15;">⚠ "${escapeHtml(state.dm_selected_branch || "")}" had no commit data — showing "${escapeHtml(branch)}" instead.</div>`;
           }
           commits.forEach((c) => {
             const sha = (c.sha || "").slice(0, 8);
@@ -802,7 +802,7 @@ def analyze_repository(repo_url):
     if (!state.dm_loaded || !gh) {
       if (state.dm_rate_limit_error) {
         repoExplorer.style.display = "block";
-        repoExplorer.innerHTML = `<div style="background:#FEF2F2;border:1px solid #FECACA;border-radius:8px;padding:14px;color:#DC2626;font-size:13px;">
+        repoExplorer.innerHTML = `<div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.25);border-radius:10px;padding:14px;color:#EF4444;font-size:13px;">
           ⚠️ <strong>GitHub API Rate Limit</strong><br>${state.dm_rate_limit_error}
         </div>`;
       } else {
@@ -894,7 +894,7 @@ def analyze_repository(repo_url):
         — ${escapeHtml(msg.split("\n")[0])}
         <span style="color:#94A3B8;font-size:11px;margin-left:8px;">${escapeHtml(author)} ${shortDate}</span>
         <details style="margin-top:4px;" onToggle="if(this.open && !this.dataset.loaded){this.dataset.loaded=1; loadCommitDetail(this, '${escapeHtml(gh.owner)}','${escapeHtml(gh.repo)}','${escapeHtml(sha)}');}">
-          <summary style="cursor:pointer;color:#0070F3;font-size:12px;">View changed files</summary>
+          <summary style="cursor:pointer;color:var(--accent,#22D3EE);font-size:12px;">View changed files</summary>
           <div class="commit-detail-${escapeHtml(sha)}" style="margin-top:6px;font-size:12px;color:#64748B;">Loading…</div>
         </details>
       </div>`;
@@ -915,7 +915,7 @@ def analyze_repository(repo_url):
           <span style="color:#334155;">${escapeHtml(f.filename || "")}</span>
           <span style="color:#22c55e;margin-left:6px;">+${f.additions||0}</span>
           <span style="color:#ef4444;margin-left:4px;">-${f.deletions||0}</span>
-          ${f.patch ? `<details style="margin-top:4px;"><summary style="cursor:pointer;color:#0070F3;font-size:11px;">Patch</summary><pre style="background:#F8FAFC;border:1px solid #E2E8F0;border-radius:6px;padding:8px;font-size:11px;overflow-x:auto;white-space:pre-wrap;">${escapeHtml(f.patch.slice(0,20000))}</pre></details>` : ""}
+          ${f.patch ? `<details style="margin-top:4px;"><summary style="cursor:pointer;color:var(--accent,#22D3EE);font-size:11px;">Patch</summary><pre style="background:#0A0A0A;border:1px solid #1E1E1E;border-radius:8px;padding:8px;font-size:11px;overflow-x:auto;white-space:pre-wrap;color:#9CA3AF;font-family:'JetBrains Mono',monospace;">${escapeHtml(f.patch.slice(0,20000))}</pre></details>` : ""}
         </div>`).join("");
     } catch(e) {
       container.textContent = `Failed to load: ${e}`;
@@ -1008,7 +1008,7 @@ def analyze_repository(repo_url):
   function renderOverviewReport(reportId, pdfUrl) {
     const fullUrl = `${BACKEND_URL}${pdfUrl}`;
     overviewReportBody.innerHTML = `
-      <iframe src="${fullUrl}" style="width:100%;height:320px;border:1px solid #E2E8F0;border-radius:8px;" title="Overview report preview"></iframe>
+      <iframe src="${fullUrl}" style="width:100%;height:320px;border:1px solid #1E1E1E;border-radius:10px;" title="Overview report preview"></iframe>
       <a href="${fullUrl}" download class="gm-btn-outline gm-btn-full" style="display:block;text-align:center;margin-top:12px;text-decoration:none;">Download PDF</a>`;
   }
 
