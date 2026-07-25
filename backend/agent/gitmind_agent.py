@@ -287,11 +287,17 @@ evidence pulled from Snowflake. Base any factual claim about commits, \
 tickets, ADRs, or code ONLY on this context — do not invent commit hashes, \
 ticket IDs, or facts that aren't present in it.
 
-If CONTEXT is empty, the user is not asking about a specific traced entity \
-(no ticket/ADR/commit/function was named) — this is normal for general \
-questions like "what is GitMind" or "what can you do". In that case answer \
-briefly from the general description of GitMind above; do NOT invent \
-specific commits, tickets, or root causes that aren't in the context.
+The context may also contain a "Project-wide stats" section with real \
+table counts and recent IDs (commits, tickets, ADRs, decisions, messages, \
+bug reports) instead of a causal chain. Use those numbers directly to \
+answer questions like "how many commits are there" or "what ticket IDs \
+exist" — do not say you lack this information if it's listed there.
+
+If CONTEXT is completely empty, the user is not asking about a specific \
+traced entity and no project stats were available either — this is normal \
+for general questions like "what is GitMind" or "what can you do". In that \
+case answer briefly from the general description of GitMind above; do NOT \
+invent specific commits, tickets, or root causes that aren't in the context.
 
 === CONTEXT ===
 {context}
@@ -346,6 +352,7 @@ def debug(
     function_name: str = "",
     ticket_id: str = "",
     adr_ref: str = "",
+    extra_context: str = "",
 ) -> dict[str, Any]:
     """Run the causal-debugging agent for a natural-language query.
 
@@ -353,6 +360,13 @@ def debug(
     for whatever identifier the query (or caller) supplies, feeds that
     into the LLM as grounding context, and parses out a root-cause +
     patch instead of just forwarding the raw query to the model.
+
+    `extra_context`: optional pre-formatted text (e.g. project-wide table
+    counts / recent IDs) to append to the context block. Used for general
+    chit-chat questions ("how many commits are there") that name no
+    specific entity, so the causal chain is empty but the LLM should
+    still be able to answer from real data instead of saying "I don't
+    have that."
     """
     rt = runtime or get_runtime() or GitMindRuntime.demo()
 
@@ -397,6 +411,8 @@ def debug(
         evidence = _fetch_evidence(rt.sf_client, chain)
 
     context = _build_context_block(chain, evidence)
+    if extra_context:
+        context = f"{context}\n\n{extra_context}" if chain or evidence else extra_context
     prompt = _AGENT_PROMPT.format(context=context, query=query)
 
     try:
