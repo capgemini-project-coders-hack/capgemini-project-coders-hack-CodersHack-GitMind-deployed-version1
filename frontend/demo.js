@@ -489,7 +489,7 @@ def analyze_repository(repo_url):
     let defs = `
       <defs>
         <marker id="gm-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-          <path d="M0,0 L10,5 L0,10 Z" fill="#6B7280"></path>
+          <path d="M0,0 L10,5 L0,10 Z" fill="var(--text-muted)"></path>
         </marker>
       </defs>`;
 
@@ -511,7 +511,7 @@ def analyze_repository(repo_url):
               stroke="#252525" stroke-width="1.5" marker-end="url(#gm-arrow)"></line>
         <g transform="translate(${midX.toFixed(1)},${midY.toFixed(1)}) rotate(${angle.toFixed(1)})">
           <rect x="${(-labelW / 2).toFixed(1)}" y="-8" width="${labelW.toFixed(1)}" height="16" rx="4" fill="var(--bg-code)" stroke="var(--border)"></rect>
-          <text x="0" y="3.5" text-anchor="middle" font-size="9" font-weight="600" letter-spacing="0.3" fill="#6B7280" font-family="JetBrains Mono, monospace">${rel}</text>
+          <text x="0" y="3.5" text-anchor="middle" font-size="9" font-weight="600" letter-spacing="0.3" fill="var(--text-muted)" font-family="JetBrains Mono, monospace">${rel}</text>
         </g>`;
     }
 
@@ -522,14 +522,14 @@ def analyze_repository(repo_url):
         <g>
           <circle cx="${node.x.toFixed(1)}" cy="${node.y.toFixed(1)}" r="${r}" fill="${node.color}" stroke="var(--bg-code)" stroke-width="3"></circle>
           <text x="${node.x.toFixed(1)}" y="${(node.y + 4).toFixed(1)}" text-anchor="middle" font-size="15" font-weight="700" fill="#fff" font-family="Inter, sans-serif">${initial}</text>
-          <text x="${node.x.toFixed(1)}" y="${(node.y + r + 16).toFixed(1)}" text-anchor="middle" font-size="11" font-weight="600" fill="#F3F4F6" font-family="Inter, sans-serif">${escapeHtml(node.label)}</text>
-          <text x="${node.x.toFixed(1)}" y="${(node.y + r + 29).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="JetBrains Mono, monospace">${escapeHtml(node.nodeId)}</text>
+          <text x="${node.x.toFixed(1)}" y="${(node.y + r + 16).toFixed(1)}" text-anchor="middle" font-size="11" font-weight="600" fill="var(--text-primary)" font-family="Inter, sans-serif">${escapeHtml(node.label)}</text>
+          <text x="${node.x.toFixed(1)}" y="${(node.y + r + 29).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="var(--text-muted)" font-family="JetBrains Mono, monospace">${escapeHtml(node.nodeId)}</text>
         </g>`;
     });
 
     return `
       <div style="margin-top:14px;background:var(--bg-code);border:1px solid var(--border);border-radius:16px;overflow-x:auto;">
-        <div style="font-size:11px;color:#6B7280;padding:10px 14px 0;text-transform:uppercase;letter-spacing:.05em;">Graph View</div>
+        <div style="font-size:11px;color:var(--text-muted);padding:10px 14px 0;text-transform:uppercase;letter-spacing:.05em;">Graph View</div>
         <svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="display:block;min-width:${width}px;">
           ${defs}
           ${edgesSvg}
@@ -563,7 +563,7 @@ def analyze_repository(repo_url):
         Commit: "#22D3EE", Function: "#22C55E", JiraTicket: "#FACC15",
         Ticket: "#FACC15", SlackMessage: "#A78BFA", ADR: "#EF4444", Decision: "#F472B6",
       };
-      let html = `<div style="padding:16px;background:#030303;border-radius:0 0 16px 16px;min-height:280px;">`;
+      let html = `<div style="padding:16px;background:var(--bg-code);border-radius:0 0 16px 16px;min-height:280px;">`;
       chain.forEach((node, i) => {
         const label = node.label || "Node";
         const color = NODE_COLORS[label] || "#64748B";
@@ -573,7 +573,7 @@ def analyze_repository(repo_url):
           <div style="display:flex;align-items:center;gap:10px;padding:8px 0;${i > 0 ? "border-top:1px dashed var(--border);" : ""}">
             <div style="width:10px;height:10px;border-radius:50%;background:${color};flex-shrink:0;"></div>
             <div>
-              <div style="font-size:12px;font-weight:600;color:#F3F4F6;">${escapeHtml(label)} <span style="color:#6B7280;font-weight:400;">${escapeHtml(nodeId.slice(0,8))}</span></div>
+              <div style="font-size:12px;font-weight:600;color:var(--text-primary);">${escapeHtml(label)} <span style="color:var(--text-muted);font-weight:400;">${escapeHtml(nodeId.slice(0,8))}</span></div>
               <div style="font-size:11px;color:var(--text-muted);">${escapeHtml(summary)}</div>
             </div>
           </div>`;
@@ -584,8 +584,8 @@ def analyze_repository(repo_url):
 
     } else if (ghCommits.length > 0) {
       // Build intent graph from real commits
-      let html = `<div style="padding:16px;background:#030303;border-radius:0 0 16px 16px;min-height:280px;">
-        <div style="font-size:11px;color:#6B7280;margin-bottom:10px;text-transform:uppercase;letter-spacing:.05em;">Commit Intent Graph — ${gh.owner}/${gh.repo}</div>`;
+      let html = `<div style="padding:16px;background:var(--bg-code);border-radius:0 0 16px 16px;min-height:280px;">
+        <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.05em;">Commit Intent Graph — ${gh.owner}/${gh.repo}</div>`;
       ghCommits.forEach((c, i) => {
         const sha = (c.sha || "").slice(0, 8);
         const msg = (c.message || "").split("\n")[0].slice(0, 70);
@@ -598,7 +598,7 @@ def analyze_repository(repo_url):
           <div style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;${i > 0 ? "border-top:1px dashed var(--border);" : ""}">
             <div style="width:10px;height:10px;border-radius:50%;background:${color};flex-shrink:0;margin-top:3px;"></div>
             <div>
-              <div style="font-size:12px;font-weight:600;color:#F3F4F6;font-family:'JetBrains Mono',monospace;">${escapeHtml(sha)}<span style="font-family:inherit;color:#6B7280;font-weight:400;margin-left:8px;font-size:11px;">${escapeHtml(author)}</span></div>
+              <div style="font-size:12px;font-weight:600;color:var(--text-primary);font-family:'JetBrains Mono',monospace;">${escapeHtml(sha)}<span style="font-family:inherit;color:var(--text-muted);font-weight:400;margin-left:8px;font-size:11px;">${escapeHtml(author)}</span></div>
               <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escapeHtml(msg)}</div>
             </div>
           </div>`;
