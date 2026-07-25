@@ -818,13 +818,14 @@ def query_gitmind(payload: GitMindQuery, request: Request) -> GitMindQueryRespon
         enriched.entity_id or enriched.function_name or enriched.ticket_id or enriched.adr_ref
     )
 
-    if intent == QueryIntent.causal or has_named_entity:
-        if not (enriched.entity_id or enriched.function_name or enriched.ticket_id or enriched.adr_ref):
-            raise HTTPException(
-                status_code=422,
-                detail="Clarify the specific Function name, Ticket ID, ADR reference, or graph node ID before running causal traversal.",
-            )
-
+    # Only actually enter the graph-trace branch when a real entity was
+    # named. A causal-sounding keyword ("why", "how") with no named entity
+    # -- e.g. "how many commits are there" -- used to hard-422 here with
+    # "Clarify the specific Function name, Ticket ID..." even though it's
+    # just ordinary chat. That's wrong: it should fall through to the
+    # general/factual branch below, which (after the chit-chat fix there)
+    # routes to the LLM instead of erroring out.
+    if has_named_entity:
         if graph is None:
             # Partial-connector state: snowflake connected but neo4j didn't
             # (or never finished initialising). Without this guard the code
