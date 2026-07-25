@@ -510,7 +510,7 @@ def analyze_repository(repo_url):
         <line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"
               stroke="#252525" stroke-width="1.5" marker-end="url(#gm-arrow)"></line>
         <g transform="translate(${midX.toFixed(1)},${midY.toFixed(1)}) rotate(${angle.toFixed(1)})">
-          <rect x="${(-labelW / 2).toFixed(1)}" y="-8" width="${labelW.toFixed(1)}" height="16" rx="4" fill="#0A0A0A" stroke="#1E1E1E"></rect>
+          <rect x="${(-labelW / 2).toFixed(1)}" y="-8" width="${labelW.toFixed(1)}" height="16" rx="4" fill="var(--bg-code)" stroke="var(--border)"></rect>
           <text x="0" y="3.5" text-anchor="middle" font-size="9" font-weight="600" letter-spacing="0.3" fill="#6B7280" font-family="JetBrains Mono, monospace">${rel}</text>
         </g>`;
     }
@@ -520,7 +520,7 @@ def analyze_repository(repo_url):
       const initial = escapeHtml(node.label.charAt(0).toUpperCase());
       nodesSvg += `
         <g>
-          <circle cx="${node.x.toFixed(1)}" cy="${node.y.toFixed(1)}" r="${r}" fill="${node.color}" stroke="#0A0A0A" stroke-width="3"></circle>
+          <circle cx="${node.x.toFixed(1)}" cy="${node.y.toFixed(1)}" r="${r}" fill="${node.color}" stroke="var(--bg-code)" stroke-width="3"></circle>
           <text x="${node.x.toFixed(1)}" y="${(node.y + 4).toFixed(1)}" text-anchor="middle" font-size="15" font-weight="700" fill="#fff" font-family="Inter, sans-serif">${initial}</text>
           <text x="${node.x.toFixed(1)}" y="${(node.y + r + 16).toFixed(1)}" text-anchor="middle" font-size="11" font-weight="600" fill="#F3F4F6" font-family="Inter, sans-serif">${escapeHtml(node.label)}</text>
           <text x="${node.x.toFixed(1)}" y="${(node.y + r + 29).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="#6B7280" font-family="JetBrains Mono, monospace">${escapeHtml(node.nodeId)}</text>
@@ -528,7 +528,7 @@ def analyze_repository(repo_url):
     });
 
     return `
-      <div style="margin-top:14px;background:#0A0A0A;border:1px solid #1E1E1E;border-radius:16px;overflow-x:auto;">
+      <div style="margin-top:14px;background:var(--bg-code);border:1px solid var(--border);border-radius:16px;overflow-x:auto;">
         <div style="font-size:11px;color:#6B7280;padding:10px 14px 0;text-transform:uppercase;letter-spacing:.05em;">Graph View</div>
         <svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="display:block;min-width:${width}px;">
           ${defs}
@@ -570,11 +570,11 @@ def analyze_repository(repo_url):
         const nodeId = node.node_id || String(i);
         const summary = (node.summary || "").slice(0, 60);
         html += `
-          <div style="display:flex;align-items:center;gap:10px;padding:8px 0;${i > 0 ? "border-top:1px dashed #1E1E1E;" : ""}">
+          <div style="display:flex;align-items:center;gap:10px;padding:8px 0;${i > 0 ? "border-top:1px dashed var(--border);" : ""}">
             <div style="width:10px;height:10px;border-radius:50%;background:${color};flex-shrink:0;"></div>
             <div>
               <div style="font-size:12px;font-weight:600;color:#F3F4F6;">${escapeHtml(label)} <span style="color:#6B7280;font-weight:400;">${escapeHtml(nodeId.slice(0,8))}</span></div>
-              <div style="font-size:11px;color:#9CA3AF;">${escapeHtml(summary)}</div>
+              <div style="font-size:11px;color:var(--text-muted);">${escapeHtml(summary)}</div>
             </div>
           </div>`;
       });
@@ -595,11 +595,11 @@ def analyze_repository(repo_url):
         const colorMap = { feat:"#22C55E", fix:"#EF4444", chore:"#6B7280", refactor:"#FACC15", docs:"#38BDF8", test:"#A78BFA", style:"#F472B6", perf:"#FB923C" };
         const color = type ? (colorMap[type[1].toLowerCase()] || "#22D3EE") : "#22D3EE";
         html += `
-          <div style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;${i > 0 ? "border-top:1px dashed #1E1E1E;" : ""}">
+          <div style="display:flex;align-items:flex-start;gap:10px;padding:7px 0;${i > 0 ? "border-top:1px dashed var(--border);" : ""}">
             <div style="width:10px;height:10px;border-radius:50%;background:${color};flex-shrink:0;margin-top:3px;"></div>
             <div>
               <div style="font-size:12px;font-weight:600;color:#F3F4F6;font-family:'JetBrains Mono',monospace;">${escapeHtml(sha)}<span style="font-family:inherit;color:#6B7280;font-weight:400;margin-left:8px;font-size:11px;">${escapeHtml(author)}</span></div>
-              <div style="font-size:11px;color:#9CA3AF;margin-top:2px;">${escapeHtml(msg)}</div>
+              <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escapeHtml(msg)}</div>
             </div>
           </div>`;
       });
@@ -678,7 +678,7 @@ def analyze_repository(repo_url):
         });
       } else if (evidence.length > 0) {
         evidence.slice(0, 5).forEach((row) => {
-          html += `<pre style="background:#0A0A0A;border:1px solid #1E1E1E;border-radius:10px;padding:12px;font-size:12px;overflow-x:auto;margin-bottom:8px;color:#9CA3AF;font-family:'JetBrains Mono',monospace;">${escapeHtml(JSON.stringify(row, null, 2))}</pre>`;
+          html += `<pre style="background:var(--bg-code);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12px;overflow-x:auto;margin-bottom:8px;color:var(--text-muted);font-family:'JetBrains Mono',monospace;">${escapeHtml(JSON.stringify(row, null, 2))}</pre>`;
         });
       } else {
         html += `<div class="dm-banner-info">No causal chain found for this query.</div>`;
@@ -915,7 +915,7 @@ def analyze_repository(repo_url):
           <span style="color:#334155;">${escapeHtml(f.filename || "")}</span>
           <span style="color:#22c55e;margin-left:6px;">+${f.additions||0}</span>
           <span style="color:#ef4444;margin-left:4px;">-${f.deletions||0}</span>
-          ${f.patch ? `<details style="margin-top:4px;"><summary style="cursor:pointer;color:var(--accent,#22D3EE);font-size:11px;">Patch</summary><pre style="background:#0A0A0A;border:1px solid #1E1E1E;border-radius:8px;padding:8px;font-size:11px;overflow-x:auto;white-space:pre-wrap;color:#9CA3AF;font-family:'JetBrains Mono',monospace;">${escapeHtml(f.patch.slice(0,20000))}</pre></details>` : ""}
+          ${f.patch ? `<details style="margin-top:4px;"><summary style="cursor:pointer;color:var(--accent,#22D3EE);font-size:11px;">Patch</summary><pre style="background:var(--bg-code);border:1px solid var(--border);border-radius:8px;padding:8px;font-size:11px;overflow-x:auto;white-space:pre-wrap;color:var(--text-muted);font-family:'JetBrains Mono',monospace;">${escapeHtml(f.patch.slice(0,20000))}</pre></details>` : ""}
         </div>`).join("");
     } catch(e) {
       container.textContent = `Failed to load: ${e}`;
@@ -1008,7 +1008,7 @@ def analyze_repository(repo_url):
   function renderOverviewReport(reportId, pdfUrl) {
     const fullUrl = `${BACKEND_URL}${pdfUrl}`;
     overviewReportBody.innerHTML = `
-      <iframe src="${fullUrl}" style="width:100%;height:320px;border:1px solid #1E1E1E;border-radius:10px;" title="Overview report preview"></iframe>
+      <iframe src="${fullUrl}" style="width:100%;height:320px;border:1px solid var(--border);border-radius:10px;" title="Overview report preview"></iframe>
       <a href="${fullUrl}" download class="gm-btn-outline gm-btn-full" style="display:block;text-align:center;margin-top:12px;text-decoration:none;">Download PDF</a>`;
   }
 
