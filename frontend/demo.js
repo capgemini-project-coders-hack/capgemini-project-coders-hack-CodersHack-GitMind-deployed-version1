@@ -264,7 +264,9 @@ def analyze_repository(repo_url):
     // hand-authored data for the Intent Knowledge Graph + Causal Trace
     // panels. Everything else below (GitHub metadata, commit stats, repo
     // explorer) still runs against the real GitHub API as usual.
-    const spoof = getSpoofedResult(state.dm_repo);
+    // Spoofed showcase data disabled -- always use the real /query result
+    // so the graph (and node hover tooltips) show actual backend summaries.
+    const spoof = null; // was: getSpoofedResult(state.dm_repo);
 
     if (spoof) {
       state.dm_result = { intent: "causal", route: ["GitMind_Agent", "Neo4j_Causal_Graph", "Snowflake_Details"], causal_chain: spoof.causal_chain, evidence: [], answer: spoof.answer };
@@ -484,6 +486,9 @@ def analyze_repository(repo_url):
       label: node.label || "Node",
       nodeId: (node.node_id || String(i)).slice(0, 10),
       color: nodeColors[node.label] || "#64748B",
+      summary: node.summary || "No description available.",
+      sourceType: node.source_type || "",
+      fullNodeId: node.node_id || String(i),
     }));
 
     let defs = `
@@ -519,7 +524,11 @@ def analyze_repository(repo_url):
     nodes.forEach((node) => {
       const initial = escapeHtml(node.label.charAt(0).toUpperCase());
       nodesSvg += `
-        <g>
+        <g class="gm-graph-node" style="cursor:pointer;"
+           data-label="${escapeHtml(node.label)}"
+           data-nodeid="${escapeHtml(node.fullNodeId)}"
+           data-summary="${escapeHtml(node.summary)}"
+           data-sourcetype="${escapeHtml(node.sourceType)}">
           <circle cx="${node.x.toFixed(1)}" cy="${node.y.toFixed(1)}" r="${r}" fill="${node.color}" stroke="var(--bg-code)" stroke-width="3"></circle>
           <text x="${node.x.toFixed(1)}" y="${(node.y + 4).toFixed(1)}" text-anchor="middle" font-size="15" font-weight="700" fill="#fff" font-family="Inter, sans-serif">${initial}</text>
           <text x="${node.x.toFixed(1)}" y="${(node.y + r + 16).toFixed(1)}" text-anchor="middle" font-size="11" font-weight="600" fill="var(--text-primary)" font-family="Inter, sans-serif">${escapeHtml(node.label)}</text>
@@ -528,14 +537,49 @@ def analyze_repository(repo_url):
     });
 
     return `
-      <div style="margin-top:14px;background:var(--bg-code);border:1px solid var(--border);border-radius:16px;overflow-x:auto;">
+      <div style="margin-top:14px;background:var(--bg-code);border:1px solid var(--border);border-radius:16px;overflow-x:auto;position:relative;">
         <div style="font-size:11px;color:var(--text-muted);padding:10px 14px 0;text-transform:uppercase;letter-spacing:.05em;">Graph View</div>
-        <svg viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="display:block;min-width:${width}px;">
+        <svg class="gm-graph-svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" style="display:block;min-width:${width}px;">
           ${defs}
           ${edgesSvg}
           ${nodesSvg}
         </svg>
+        <div class="gm-node-tooltip" style="display:none;position:absolute;z-index:50;max-width:260px;padding:10px 12px;background:#111;border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.35);pointer-events:none;">
+          <div class="gm-tt-label" style="font-size:11px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;margin-bottom:4px;"></div>
+          <div class="gm-tt-id" style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--text-muted);margin-bottom:6px;"></div>
+          <div class="gm-tt-summary" style="font-size:12px;line-height:1.4;color:#e5e5e5;"></div>
+        </div>
       </div>`;
+  }
+
+  // ── Node hover tooltip wiring ────────────────────────────────────────────
+  function attachGraphNodeTooltips(root) {
+    const svgHost = root.querySelector(".gm-graph-svg");
+    const tooltip = root.querySelector(".gm-node-tooltip");
+    if (!tooltip || !svgHost) return;
+    const hostBox = svgHost.parentElement; // position:relative div wrapping svg + tooltip
+
+    svgHost.querySelectorAll(".gm-graph-node").forEach((g) => {
+      const color = g.querySelector("circle") ? g.querySelector("circle").getAttribute("fill") : "#64748B";
+      g.addEventListener("mouseenter", () => {
+        tooltip.querySelector(".gm-tt-label").textContent = g.dataset.label;
+        tooltip.querySelector(".gm-tt-label").style.color = color;
+        tooltip.querySelector(".gm-tt-id").textContent =
+          g.dataset.nodeid + (g.dataset.sourcetype ? "  ·  " + g.dataset.sourcetype : "");
+        tooltip.querySelector(".gm-tt-summary").textContent = g.dataset.summary;
+        tooltip.style.display = "block";
+      });
+      g.addEventListener("mousemove", (e) => {
+        const hostRect = hostBox.getBoundingClientRect();
+        let left = e.clientX - hostRect.left + 16;
+        let top = e.clientY - hostRect.top + 16;
+        tooltip.style.left = left + "px";
+        tooltip.style.top = top + "px";
+      });
+      g.addEventListener("mouseleave", () => {
+        tooltip.style.display = "none";
+      });
+    });
   }
 
   function renderGraph() {
@@ -581,6 +625,7 @@ def analyze_repository(repo_url):
       html += `</div>`;
       html += buildCausalGraphSVG(chain, NODE_COLORS);
       graphPanelBody.innerHTML = html;
+      attachGraphNodeTooltips(graphPanelBody);
 
     } else if (ghCommits.length > 0) {
       // Build intent graph from real commits
