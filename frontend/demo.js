@@ -529,7 +529,7 @@ def analyze_repository(repo_url):
            data-nodeid="${escapeHtml(node.fullNodeId)}"
            data-summary="${escapeHtml(node.summary)}"
            data-sourcetype="${escapeHtml(node.sourceType)}">
-          <circle cx="${node.x.toFixed(1)}" cy="${node.y.toFixed(1)}" r="${r}" fill="${node.color}" stroke="var(--bg-code)" stroke-width="3"></circle>
+          <circle class="gm-node-circle" cx="${node.x.toFixed(1)}" cy="${node.y.toFixed(1)}" r="${r}" fill="${node.color}" stroke="var(--bg-code)" stroke-width="3" style="transform-box:fill-box;transform-origin:center;transition:transform 120ms ease;"></circle>
           <text x="${node.x.toFixed(1)}" y="${(node.y + 4).toFixed(1)}" text-anchor="middle" font-size="15" font-weight="700" fill="#fff" font-family="Inter, sans-serif">${initial}</text>
           <text x="${node.x.toFixed(1)}" y="${(node.y + r + 16).toFixed(1)}" text-anchor="middle" font-size="11" font-weight="600" fill="var(--text-primary)" font-family="Inter, sans-serif">${escapeHtml(node.label)}</text>
           <text x="${node.x.toFixed(1)}" y="${(node.y + r + 29).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="var(--text-muted)" font-family="JetBrains Mono, monospace">${escapeHtml(node.nodeId)}</text>
@@ -560,8 +560,10 @@ def analyze_repository(repo_url):
     const hostBox = svgHost.parentElement; // position:relative div wrapping svg + tooltip
 
     svgHost.querySelectorAll(".gm-graph-node").forEach((g) => {
-      const color = g.querySelector("circle") ? g.querySelector("circle").getAttribute("fill") : "#64748B";
+      const circle = g.querySelector(".gm-node-circle");
+      const color = circle ? circle.getAttribute("fill") : "#64748B";
       g.addEventListener("mouseenter", () => {
+        if (circle) circle.style.transform = "scale(1.18)";
         tooltip.querySelector(".gm-tt-label").textContent = g.dataset.label;
         tooltip.querySelector(".gm-tt-label").style.color = color;
         tooltip.querySelector(".gm-tt-id").textContent =
@@ -577,6 +579,7 @@ def analyze_repository(repo_url):
         tooltip.style.top = top + "px";
       });
       g.addEventListener("mouseleave", () => {
+        if (circle) circle.style.transform = "scale(1)";
         tooltip.style.display = "none";
       });
     });
