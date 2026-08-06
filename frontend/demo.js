@@ -571,20 +571,45 @@ def analyze_repository(repo_url):
       }, 200); // grace period: survives scroll-induced mouseleave / lets user move cursor onto tooltip
     };
 
-    const clampToHost = (left, top) => {
+    // hostBox scrolls (overflow-x:auto). Absolute-positioned children (like the
+    // tooltip) are placed relative to hostBox's *content* box, not its visible
+    // viewport — so left/top must include hostBox.scrollLeft/scrollTop or the
+    // tooltip renders offset by the scroll amount and looks "stuck" while the
+    // graph moves underneath it.
+    const posFromClient = (clientX, clientY) => {
       const hostRect = hostBox.getBoundingClientRect();
       const ttRect = tooltip.getBoundingClientRect();
-      const maxLeft = hostRect.width - ttRect.width - 8;
-      const maxTop = hostRect.height - ttRect.height - 8;
+      // Desired position in *visible viewport* space, clamped so tooltip stays on-screen.
+      let viewLeft = clientX - hostRect.left + 16;
+      let viewTop = clientY - hostRect.top + 16;
+      const maxViewLeft = hostRect.width - ttRect.width - 8;
+      const maxViewTop = hostRect.height - ttRect.height - 8;
+      viewLeft = Math.max(8, Math.min(viewLeft, Math.max(8, maxViewLeft)));
+      viewTop = Math.max(8, Math.min(viewTop, Math.max(8, maxViewTop)));
+      // Convert viewport-space position into hostBox content-space, so it
+      // tracks correctly as the user scrolls the graph.
       return {
-        left: Math.max(8, Math.min(left, Math.max(8, maxLeft))),
-        top: Math.max(8, Math.min(top, Math.max(8, maxTop))),
+        left: viewLeft + hostBox.scrollLeft,
+        top: viewTop + hostBox.scrollTop,
       };
+    };
+
+    let lastClientX = null;
+    let lastClientY = null;
+    const reposition = () => {
+      if (lastClientX === null || tooltip.style.display === "none") return;
+      const pos = posFromClient(lastClientX, lastClientY);
+      tooltip.style.left = pos.left + "px";
+      tooltip.style.top = pos.top + "px";
     };
 
     // Keep tooltip open (and let user scroll inside it) when the pointer moves onto it.
     tooltip.addEventListener("mouseenter", cancelHide);
     tooltip.addEventListener("mouseleave", () => scheduleHide(null));
+
+    // Dragging the scrollbar / trackpad-scrolling the graph doesn't fire
+    // mousemove on the node, so the tooltip must reposition on scroll too.
+    hostBox.addEventListener("scroll", reposition, { passive: true });
 
     svgHost.querySelectorAll(".gm-graph-node").forEach((g) => {
       const circle = g.querySelector(".gm-node-circle");
@@ -598,16 +623,14 @@ def analyze_repository(repo_url):
           g.dataset.nodeid + (g.dataset.sourcetype ? "  ·  " + g.dataset.sourcetype : "");
         tooltip.querySelector(".gm-tt-summary").textContent = g.dataset.summary;
         tooltip.style.display = "block";
-        const hostRect = hostBox.getBoundingClientRect();
-        const raw = clampToHost(e.clientX - hostRect.left + 16, e.clientY - hostRect.top + 16);
-        tooltip.style.left = raw.left + "px";
-        tooltip.style.top = raw.top + "px";
+        lastClientX = e.clientX;
+        lastClientY = e.clientY;
+        reposition();
       });
       g.addEventListener("mousemove", (e) => {
-        const hostRect = hostBox.getBoundingClientRect();
-        const pos = clampToHost(e.clientX - hostRect.left + 16, e.clientY - hostRect.top + 16);
-        tooltip.style.left = pos.left + "px";
-        tooltip.style.top = pos.top + "px";
+        lastClientX = e.clientX;
+        lastClientY = e.clientY;
+        reposition();
       });
       g.addEventListener("mouseleave", () => scheduleHide(circle));
     });
