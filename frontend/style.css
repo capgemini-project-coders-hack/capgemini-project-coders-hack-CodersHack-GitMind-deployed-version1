@@ -776,6 +776,8 @@ select.gm-text-input { cursor: pointer; }
 }
 .dm-input-row .gm-text-input { flex: 1; min-width: 240px; }
 .dm-analyze-btn { height: 44px; padding: 0 28px; white-space: nowrap; font-size: 14px; }
+.dm-history-item:hover { background: var(--bg-hover); }
+.dm-history-item-remove:hover { color: var(--text-primary); }
 
 /* ── Code Editor ──────────────────────────────────────────── */
 .dm-code {
