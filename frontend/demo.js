@@ -129,8 +129,95 @@ def analyze_repository(repo_url):
 
   const form = document.getElementById("analyzeForm");
   const repoUrlInput = document.getElementById("repoUrlInput");
+  const repoUrlHistoryEl = document.getElementById("repoUrlHistory");
   const analyzeBtn = document.getElementById("analyzeBtn");
   const repoUrlError = document.getElementById("repoUrlError");
+
+  // ── Repo URL history (localStorage) ─────────────────────────────────────
+  const REPO_HISTORY_KEY = "gitmind-repo-url-history";
+  const REPO_HISTORY_MAX = 10;
+
+  function loadRepoHistory() {
+    try {
+      const raw = localStorage.getItem(REPO_HISTORY_KEY);
+      const arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveRepoHistory(url) {
+    const trimmed = (url || "").trim();
+    if (!trimmed) return;
+    let list = loadRepoHistory().filter((u) => u !== trimmed);
+    list.unshift(trimmed);
+    list = list.slice(0, REPO_HISTORY_MAX);
+    try {
+      localStorage.setItem(REPO_HISTORY_KEY, JSON.stringify(list));
+    } catch {
+      /* storage full/unavailable — ignore, history is a convenience only */
+    }
+  }
+
+  function removeRepoHistoryEntry(url) {
+    const list = loadRepoHistory().filter((u) => u !== url);
+    try {
+      localStorage.setItem(REPO_HISTORY_KEY, JSON.stringify(list));
+    } catch { /* ignore */ }
+    renderRepoHistoryDropdown();
+  }
+
+  function renderRepoHistoryDropdown() {
+    const filter = repoUrlInput.value.trim().toLowerCase();
+    const list = loadRepoHistory().filter((u) => !filter || u.toLowerCase().includes(filter));
+    if (list.length === 0) {
+      repoUrlHistoryEl.style.display = "none";
+      repoUrlHistoryEl.innerHTML = "";
+      return;
+    }
+    repoUrlHistoryEl.innerHTML =
+      `<div style="padding:8px 12px;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted);border-bottom:1px solid var(--border);">Recent repositories</div>` +
+      list
+        .map(
+          (u) => `
+        <div class="dm-history-item" data-url="${escapeHtml(u)}" style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;cursor:pointer;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);">
+          <span class="dm-history-item-url" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(u)}</span>
+          <span class="dm-history-item-remove" data-url="${escapeHtml(u)}" title="Remove" style="flex-shrink:0;color:var(--text-muted);padding:0 4px;">&times;</span>
+        </div>`
+        )
+        .join("");
+    repoUrlHistoryEl.style.display = "block";
+  }
+
+  repoUrlHistoryEl.addEventListener("mousedown", (e) => {
+    // mousedown (not click) so this fires before the input's blur hides the dropdown
+    const removeBtn = e.target.closest(".dm-history-item-remove");
+    if (removeBtn) {
+      e.preventDefault();
+      removeRepoHistoryEntry(removeBtn.dataset.url);
+      return;
+    }
+    const item = e.target.closest(".dm-history-item");
+    if (item) {
+      e.preventDefault();
+      repoUrlInput.value = item.dataset.url;
+      repoUrlHistoryEl.style.display = "none";
+      setRepoUrlError(null);
+    }
+  });
+
+  repoUrlInput.addEventListener("focus", renderRepoHistoryDropdown);
+  repoUrlInput.addEventListener("input", renderRepoHistoryDropdown);
+  repoUrlInput.addEventListener("blur", () => {
+    // small delay so a click on a dropdown item still registers
+    setTimeout(() => { repoUrlHistoryEl.style.display = "none"; }, 150);
+  });
+  document.addEventListener("click", (e) => {
+    if (!document.getElementById("repoUrlWrap").contains(e.target)) {
+      repoUrlHistoryEl.style.display = "none";
+    }
+  });
 
   // ── GitHub repo URL validation ──────────────────────────────────────────
   const GITHUB_REPO_RE = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?\/?$/;
@@ -1165,6 +1252,8 @@ def analyze_repository(repo_url):
       return;
     }
     setRepoUrlError(null);
+    repoUrlHistoryEl.style.display = "none";
+    saveRepoHistory(repoUrlInput.value.trim());
     runAnalysis(repoUrlInput.value);
   });
 
