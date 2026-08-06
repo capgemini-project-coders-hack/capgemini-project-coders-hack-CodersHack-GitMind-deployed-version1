@@ -63,7 +63,10 @@
   <div class="dm-sub">Enter a repository URL to run a live analysis. Sample data loads automatically.</div>
 
   <form id="analyzeForm" class="dm-input-row" autocomplete="off">
-    <input type="text" id="repoUrlInput" class="gm-text-input" placeholder="https://github.com/owner/repository" aria-label="GitHub Repository URL">
+    <div id="repoUrlWrap" style="position:relative;flex:1;min-width:240px;">
+      <input type="text" id="repoUrlInput" class="gm-text-input" style="width:100%;" placeholder="https://github.com/owner/repository" aria-label="GitHub Repository URL">
+      <div id="repoUrlHistory" style="display:none;position:absolute;left:0;right:0;top:calc(100% + 6px);z-index:40;background:var(--bg-code);border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.25);max-height:260px;overflow-y:auto;"></div>
+    </div>
     <div id="repoUrlError" class="dm-banner-error" style="display:none;margin-top:8px;"></div>
 
     <button type="submit" class="gm-btn dm-analyze-btn" id="analyzeBtn">Analyze</button>
