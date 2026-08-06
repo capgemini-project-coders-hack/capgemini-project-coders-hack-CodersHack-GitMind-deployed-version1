@@ -544,10 +544,10 @@ def analyze_repository(repo_url):
           ${edgesSvg}
           ${nodesSvg}
         </svg>
-        <div class="gm-node-tooltip" style="display:none;position:absolute;z-index:50;max-width:260px;padding:10px 12px;background:#111;border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.35);pointer-events:none;">
+        <div class="gm-node-tooltip" style="display:none;position:absolute;z-index:50;max-width:260px;max-height:220px;overflow-y:auto;padding:10px 12px;background:#111;border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.35);pointer-events:auto;">
           <div class="gm-tt-label" style="font-size:11px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;margin-bottom:4px;"></div>
           <div class="gm-tt-id" style="font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--text-muted);margin-bottom:6px;"></div>
-          <div class="gm-tt-summary" style="font-size:12px;line-height:1.4;color:#e5e5e5;"></div>
+          <div class="gm-tt-summary" style="font-size:12px;line-height:1.4;color:#e5e5e5;white-space:normal;word-break:break-word;"></div>
         </div>
       </div>`;
   }
@@ -559,10 +559,38 @@ def analyze_repository(repo_url):
     if (!tooltip || !svgHost) return;
     const hostBox = svgHost.parentElement; // position:relative div wrapping svg + tooltip
 
+    let hideTimer = null;
+    const cancelHide = () => {
+      if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    };
+    const scheduleHide = (circle) => {
+      cancelHide();
+      hideTimer = setTimeout(() => {
+        if (circle) circle.style.transform = "scale(1)";
+        tooltip.style.display = "none";
+      }, 200); // grace period: survives scroll-induced mouseleave / lets user move cursor onto tooltip
+    };
+
+    const clampToHost = (left, top) => {
+      const hostRect = hostBox.getBoundingClientRect();
+      const ttRect = tooltip.getBoundingClientRect();
+      const maxLeft = hostRect.width - ttRect.width - 8;
+      const maxTop = hostRect.height - ttRect.height - 8;
+      return {
+        left: Math.max(8, Math.min(left, Math.max(8, maxLeft))),
+        top: Math.max(8, Math.min(top, Math.max(8, maxTop))),
+      };
+    };
+
+    // Keep tooltip open (and let user scroll inside it) when the pointer moves onto it.
+    tooltip.addEventListener("mouseenter", cancelHide);
+    tooltip.addEventListener("mouseleave", () => scheduleHide(null));
+
     svgHost.querySelectorAll(".gm-graph-node").forEach((g) => {
       const circle = g.querySelector(".gm-node-circle");
       const color = circle ? circle.getAttribute("fill") : "#64748B";
-      g.addEventListener("mouseenter", () => {
+      g.addEventListener("mouseenter", (e) => {
+        cancelHide();
         if (circle) circle.style.transform = "scale(1.18)";
         tooltip.querySelector(".gm-tt-label").textContent = g.dataset.label;
         tooltip.querySelector(".gm-tt-label").style.color = color;
@@ -570,18 +598,18 @@ def analyze_repository(repo_url):
           g.dataset.nodeid + (g.dataset.sourcetype ? "  ·  " + g.dataset.sourcetype : "");
         tooltip.querySelector(".gm-tt-summary").textContent = g.dataset.summary;
         tooltip.style.display = "block";
+        const hostRect = hostBox.getBoundingClientRect();
+        const raw = clampToHost(e.clientX - hostRect.left + 16, e.clientY - hostRect.top + 16);
+        tooltip.style.left = raw.left + "px";
+        tooltip.style.top = raw.top + "px";
       });
       g.addEventListener("mousemove", (e) => {
         const hostRect = hostBox.getBoundingClientRect();
-        let left = e.clientX - hostRect.left + 16;
-        let top = e.clientY - hostRect.top + 16;
-        tooltip.style.left = left + "px";
-        tooltip.style.top = top + "px";
+        const pos = clampToHost(e.clientX - hostRect.left + 16, e.clientY - hostRect.top + 16);
+        tooltip.style.left = pos.left + "px";
+        tooltip.style.top = pos.top + "px";
       });
-      g.addEventListener("mouseleave", () => {
-        if (circle) circle.style.transform = "scale(1)";
-        tooltip.style.display = "none";
-      });
+      g.addEventListener("mouseleave", () => scheduleHide(circle));
     });
   }
 
