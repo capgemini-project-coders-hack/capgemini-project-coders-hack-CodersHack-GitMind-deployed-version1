@@ -417,7 +417,14 @@ def debug(
 
     try:
         response = llm.invoke(prompt)
-        text = getattr(response, "content", str(response))
+        content = getattr(response, "content", response)
+        if isinstance(content, list):
+            text = "".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in content
+            )
+        else:
+            text = content if isinstance(content, str) else str(content)
     except Exception as exc:  # noqa: BLE001 - surface as a soft failure, not a 500
         log.warning("LLM call failed: %s", exc)
         return {
